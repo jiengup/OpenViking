@@ -1442,3 +1442,79 @@ repo/
 edit-one 的 Semantic DAG 从 shared-only 基线 33.92s 降至 1.34s，下降 96.1%；EmbeddingQueue 新消息从 27 条降至 1 条。与上一版仅 local artifact + MD5 diff 的 edit-one（38.06s、Semantic DAG 27.07s、9 条 embedding）相比，最小 DAG 又将端到端时间降至 12.20s，并把目录遍历和未变化分支的向量工作收敛掉。
 
 三轮均通过 40/40 正式文件、40/40 正文和 40/40 L2 校验，missing、unexpected、content mismatch 均为空，队列 error_count 为 0；no-op 前后 Semantic/Embedding processed 计数不增加。证据目录：`.scratch/ingest-profile/semantic-plan40-20260913-212633`。每个场景仍只有 1 个有效样本，数据用于功能和工作量收敛验证，不宣称 P95 或统计显著性。
+
+### 18.13 当前提交 AGFS/local 严格对照
+
+为验证 SemanticPlan 在 AGFS 解析产物模式下的行为，并隔离 local/AGFS 这一变量，在提交 `62dcb56de` 上使用同一份 frozen 40 文件分别运行：
+
+- 输入均为 shared HTTP ZIP，上传后固定等待 5 秒。
+- 正式文件系统均为远程 S3，向量库均为本地向量库。
+- 文件数 40、总大小 424,369 bytes、总行数 11,629，两个运行目录中的输入 manifest 完全一致。
+- 唯一配置差异是 `storage.parse_output.mode=agfs/local`。
+
+#### 端到端耗时
+
+| 场景 | 优化前 shared-only | 当前 SemanticPlan + AGFS | 当前 SemanticPlan + local | AGFS 相对优化前 | local 相对 AGFS |
+|---|---:|---:|---:|---:|---:|
+| initial | 100.85s | 100.88s | 87.00s | 基本持平 | -13.8% |
+| no-op | 77.07s | 48.82s | 10.24s | -36.7% | -79.0% |
+| edit-one | 75.02s | 43.56s | 10.77s | -41.9% | -75.3% |
+
+表中均包含每轮 shared 上传后的 5 秒测试等待。优化前 shared-only fixture 为同样 40 个路径，但旧提交下总大小为 420,774 bytes、11,534 行；因此“当前 AGFS 相对优化前”是近似同规模对照。当前 AGFS 与当前 local 的 manifest 字节级一致，是只切换 parse output backend 的严格对照。initial 包含真实 LLM 调用，受远程模型时延影响较大；no-op 与 edit-one 更适合衡量存储路径收益。
+
+#### 当前 AGFS 分阶段耗时
+
+以下为 `wall_union_s`，阶段之间可能嵌套，不能直接相加还原端到端时间。
+
+| 阶段 | initial | no-op | edit-one |
+|---|---:|---:|---:|
+| shared 上传 | 0.61s | 0.13s | 0.19s |
+| shared 物化到 worker | 0.15s | 0.54s | 0.25s |
+| 解析并写 AGFS temp | 18.27s | 18.31s | 16.25s |
+| TreeBuilder finalize | 0.04s | 0.06s | 0.02s |
+| artifact 图片 URI 规范化 | 1.51s | 1.02s | 0.81s |
+| N/F/V 快照 | — | 0.043s | 0.046s |
+| diff apply / 正式树提交 | 首次全量提交 12.24s | 17.38s | 15.49s |
+| SemanticPlan 构造 | 0.001s | 0.001s | 0.002s |
+| Semantic DAG | 54.15s | 0s | 1.20s |
+| AGFS temp 清理 | 6.01s | 2.72s | 2.35s |
+| 端到端 | 100.88s | 48.82s | 43.56s |
+
+#### 当前 AGFS/local 增量阶段对照
+
+| 场景/阶段 | AGFS | local | 结论 |
+|---|---:|---:|---|
+| no-op / 解析及产物写入 | 18.31s | 0.22s | AGFS 逐文件远程写 temp；local 写本地目录 |
+| no-op / 图片 URI 规范化 | 1.02s | 0.008s | AGFS 需要远程列举/读取；local 为本地操作 |
+| no-op / N/F/V 快照 | 0.043s | 0.036s | 两者接近，快照查询不是主要瓶颈 |
+| no-op / diff apply | 17.38s | 0.00004s | AGFS artifact 缺 MD5 manifest，40 文件回退远程正文比较 |
+| no-op / Semantic DAG | 0s | 0s | 两者都识别为健康 no-op，不入 SemanticQueue |
+| no-op / temp 清理 | 2.72s | 无远程清理 | AGFS 删除远程 temp 树 |
+| edit-one / 解析及产物写入 | 16.25s | 0.13s | 修改比例不影响 AGFS 全量 temp 上传 |
+| edit-one / 图片 URI 规范化 | 0.81s | 0.008s | 同上 |
+| edit-one / N/F/V 快照 | 0.046s | 0.036s | 两者接近 |
+| edit-one / diff apply | 15.49s | 0.067s | AGFS 仍先远程比较 40 个文件，local 按 manifest MD5 只提交变化文件 |
+| edit-one / Semantic DAG | 1.20s | 0.89s | 两者均执行相同最小 DAG，差异属于远程 I/O/运行波动 |
+| edit-one / temp 清理 | 2.35s | 无远程清理 | AGFS 删除远程 temp 树 |
+
+#### 队列工作量和正确性
+
+| 场景 | AGFS Semantic | AGFS Embedding | local Semantic | local Embedding | 文件/正文/L2 校验 |
+|---|---:|---:|---:|---:|---|
+| initial | 1 | 54 | 1 | 54 | 两组均 40/40/40 |
+| no-op | 0 | 0 | 0 | 0 | 两组均 40/40/40 |
+| edit-one | 1 | 1 | 1 | 1 | 两组均 40/40/40 |
+
+队列计数只统计当前资源请求归属的根消息；initial 的阶段探针观察到 56 次 embedding handler/upsert，其中另有父目录刷新产生的 2 条目录向量。两种模式的语义工作量一致：initial 都是 40 个文件节点、8 个目录节点；no-op 均没有语义 DAG；edit-one 均为 1 个文件节点和 1 个快速目录判断，实际目录 LLM 为 0。
+
+六轮 API 均为 `success`，文件和正文校验均为 40/40，L2 索引均为 40/40；missing files、unexpected files、content mismatches、missing vectors、Semantic error_count 和 Embedding error_count 均为 0。跨模式 edit-one 终态 validation 完全相同。本次没有保存全量 L0/L1 正文及 dense vector 快照，因此不宣称两次独立模型生成的目录摘要或浮点向量字节级一致。
+
+AGFS 剩余瓶颈已经定位：当前 `CodeRepositoryParser` 的 AGFS 旧写入分支不会生成 `.artifact_manifest.json`，导致新树文件没有预计算 MD5。增量 diff 因而对所有 40 个文件走正文回退比较，从 AGFS temp 和正式 S3 读取 bytes；即使 no-op，`resource_diff_apply` 仍需 17.38 秒。后续若让 AGFS 写入也统一走 `AgfsParseOutputStore` 并在写最终 bytes 时生成 MD5 manifest，可消除这部分全量远程正文比较；但每轮 16–18 秒的 AGFS temp 全量上传及 2–3 秒清理仍然存在。
+
+证据目录：
+
+- 当前 AGFS：`.scratch/ingest-profile/semantic-plan40-agfs-profiled-20260913-2250`
+- 当前 local：`.scratch/ingest-profile/semantic-plan40-local-profiled-20260913-2300`
+- 优化前 shared-only：`/Users/bytedance/github_openviking/OpenViking/.worktrees/add-resource-shared-baseline/.scratch/ingest-profile/shared-only-baseline40-20260913-012946`
+
+每个场景各 1 个有效样本，结论用于验证功能、阶段归因和工作量收敛，不宣称 P95 或统计显著性。
