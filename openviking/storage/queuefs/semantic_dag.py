@@ -7,7 +7,7 @@ import re
 import threading
 from contextlib import nullcontext
 from dataclasses import dataclass, field
-from typing import Any, ClassVar, Dict, List, Optional, Set
+from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Set
 from weakref import WeakKeyDictionary
 
 from openviking.parse.parsers.media import get_media_type
@@ -23,6 +23,7 @@ from openviking.storage.abstract_overview import (
     write_abstract_overview,
 )
 from openviking.storage.acl import CreatorAclGrant
+from openviking.storage.queuefs.semantic_plan import FileVectorSource
 from openviking.storage.viking_fs import LS_ALL_NODES, get_viking_fs
 from openviking.telemetry import bind_telemetry, get_current_telemetry
 from openviking.utils.content_hash import content_md5
@@ -32,6 +33,9 @@ from openviking_cli.utils.config import get_openviking_config
 from openviking_cli.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+if TYPE_CHECKING:
+    from openviking.storage.queuefs.semantic_plan import SemanticPlan, SemanticTreeEntry
 
 # Session-internal files that should never be summarized by the semantic pipeline.
 # These are canonical archives (e.g. session transcripts) whose content provides
@@ -186,6 +190,7 @@ class SemanticDagExecutor:
         artifact_store: Optional[Any] = None,
         artifact_ref: Optional[Any] = None,
         file_abstracts: Optional[Dict[str, str]] = None,
+        semantic_plan: Optional["SemanticPlan"] = None,
     ):
         self._processor = processor
         self._context_type = context_type
@@ -195,11 +200,25 @@ class SemanticDagExecutor:
         self._target_preexisting = target_preexisting
         self._recursive = recursive
         self._lock = lock
-        self._is_code_repo = is_code_repo
+        self._is_code_repo = bool(
+            is_code_repo
+            or (
+                semantic_plan is not None
+                and semantic_plan.file_vector_source is FileVectorSource.SUMMARY_WHEN_AVAILABLE
+            )
+        )
         self._changes_provided = changes is not None
         self._changes = changes or {}
-        self._skip_vectorization = skip_vectorization
-        self._ingest_options = IngestOptions.from_value(ingest_options)
+        self._semantic_plan = semantic_plan
+        self._semantic_resource_root = (
+            semantic_plan.root_uri.rstrip("/") if semantic_plan is not None else None
+        )
+        self._skip_vectorization = (
+            not semantic_plan.outputs.vectorize if semantic_plan is not None else skip_vectorization
+        )
+        self._ingest_options = IngestOptions.from_value(
+            semantic_plan.ingest_options if semantic_plan is not None else ingest_options
+        )
         self._coalesce_key = coalesce_key
         self._coalesce_version = coalesce_version
         self._source = dict(source) if source else None
@@ -225,6 +244,11 @@ class SemanticDagExecutor:
         self._artifact_store = artifact_store
         self._artifact_ref = artifact_ref
         self._file_abstracts = dict(file_abstracts or {})
+        self._plan_entries_by_uri: Dict[str, "SemanticTreeEntry"] = {}
+        self._plan_children: Dict[str, tuple[List[str], List[str]]] = {}
+        self._plan_active_dirs: Set[str] = set()
+        if semantic_plan is not None:
+            self._initialize_semantic_plan(semantic_plan)
         self._node_concurrency = max(1, max_concurrent_llm)
         self._llm_sem = asyncio.Semaphore(max_concurrent_llm)
         self._viking_fs = get_viking_fs()
@@ -245,10 +269,91 @@ class SemanticDagExecutor:
         self._overview_cache_lock = asyncio.Lock()
         self._root_write_result = AbstractOverviewWriteResult(wrote=False)
 
+    @staticmethod
+    def _entry_record_abstract(entry: "SemanticTreeEntry", level: int) -> str:
+        return next(
+            (
+                str(record.abstract or "")
+                for record in entry.indexed_records
+                if record.level == level
+            ),
+            "",
+        )
+
+    def _initialize_semantic_plan(self, plan: "SemanticPlan") -> None:
+        root = plan.root_uri.rstrip("/")
+        root_entry = next(
+            (entry for entry in plan.tree.entries if entry.relative_path == ""),
+            None,
+        )
+        self._target_preexisting = not (root_entry is not None and root_entry.state == "added")
+        current_entries = [entry for entry in plan.tree.entries if entry.state != "deleted"]
+        children: Dict[str, tuple[List[str], List[str]]] = {}
+        for entry in current_entries:
+            uri = root if not entry.relative_path else f"{root}/{entry.relative_path}"
+            self._plan_entries_by_uri[uri] = entry
+            if not entry.relative_path:
+                continue
+            parent_rel = entry.relative_path.rsplit("/", 1)[0] if "/" in entry.relative_path else ""
+            parent_uri = root if not parent_rel else f"{root}/{parent_rel}"
+            dirs, files = children.setdefault(parent_uri, ([], []))
+            (dirs if entry.kind == "directory" else files).append(uri)
+
+        changed_uris: List[str] = []
+        for entry in plan.tree.entries:
+            if entry.state == "unchanged":
+                continue
+            uri = root if not entry.relative_path else f"{root}/{entry.relative_path}"
+            changed_uris.append(uri)
+            if entry.kind == "directory" and entry.state in {"added", "modified"}:
+                self._plan_active_dirs.add(uri)
+            if entry.relative_path:
+                self._plan_active_dirs.add(uri.rsplit("/", 1)[0])
+        for active_uri in list(self._plan_active_dirs):
+            current = active_uri
+            while current != root and current.startswith(root + "/"):
+                parent = current.rsplit("/", 1)[0]
+                if parent not in self._plan_entries_by_uri:
+                    break
+                self._plan_active_dirs.add(parent)
+                current = parent
+
+        self._plan_children = {
+            uri: (sorted(dirs), sorted(files)) for uri, (dirs, files) in children.items()
+        }
+        self._incremental_update = True
+        self._target_uri = root
+        self._recursive = True
+        self._changes_provided = True
+        self._changed_paths = set(changed_uris)
+        self._added_paths = {
+            uri for uri, entry in self._plan_entries_by_uri.items() if entry.state == "added"
+        }
+        self._modified_paths = {
+            uri for uri, entry in self._plan_entries_by_uri.items() if entry.state == "modified"
+        }
+        self._tree_changed_paths = {
+            root if not entry.relative_path else f"{root}/{entry.relative_path}"
+            for entry in plan.tree.entries
+            if entry.state in {"added", "deleted"}
+        }
+        self._file_md5s = {
+            uri: str(entry.md5)
+            for uri, entry in self._plan_entries_by_uri.items()
+            if entry.kind == "file" and entry.md5
+        }
+        self._file_abstracts = {
+            uri: abstract
+            for uri, entry in self._plan_entries_by_uri.items()
+            if entry.kind == "file" and (abstract := self._entry_record_abstract(entry, 2))
+        }
+
     def _creator_acl_grant(self, uri: str) -> CreatorAclGrant | None:
         normalized = uri.rstrip("/")
-        if self._generation_trigger == "resource_ingest" and self._target_preexisting is False:
-            root = self._root_uri.rstrip("/")
+        if (
+            self._generation_trigger == "resource_ingest" or self._semantic_plan is not None
+        ) and self._target_preexisting is False:
+            root = (self._semantic_resource_root or self._root_uri).rstrip("/")
             if normalized == root:
                 return CreatorAclGrant.DIRECT
             if normalized.startswith(f"{root}/"):
@@ -435,6 +540,60 @@ class SemanticDagExecutor:
             )
             file_index = {path: idx for idx, path in enumerate(file_paths)}
             child_index = {path: idx for idx, path in enumerate(children_dirs)}
+            if self._semantic_plan is not None:
+                required_file_paths = {
+                    path
+                    for path in file_paths
+                    if self._plan_entries_by_uri[path].state in {"added", "modified"}
+                }
+                required_children_dirs = {
+                    path for path in children_dirs if path in self._plan_active_dirs
+                }
+                file_summaries: List[Optional[Dict[str, str]]] = [None] * len(file_paths)
+                children_abstracts: List[Optional[Dict[str, str]]] = [None] * len(children_dirs)
+                for path in file_paths:
+                    if path in required_file_paths or path not in sampled_file_paths:
+                        continue
+                    abstract = self._entry_record_abstract(self._plan_entries_by_uri[path], 2)
+                    if not abstract:
+                        raise RuntimeError(f"Semantic plan lacks L2 abstract for {path}")
+                    file_summaries[file_index[path]] = {
+                        "name": path.rsplit("/", 1)[-1],
+                        "summary": abstract,
+                    }
+                for path in children_dirs:
+                    if path in required_children_dirs or path not in sampled_children_dirs:
+                        continue
+                    abstract = self._entry_record_abstract(self._plan_entries_by_uri[path], 0)
+                    if not abstract:
+                        raise RuntimeError(f"Semantic plan lacks L0 abstract for {path}")
+                    children_abstracts[child_index[path]] = {
+                        "name": path.rsplit("/", 1)[-1],
+                        "abstract": abstract,
+                    }
+                pending = len(required_file_paths) + len(required_children_dirs)
+                node = DirNode(
+                    uri=dir_uri,
+                    children_dirs=children_dirs,
+                    file_paths=file_paths,
+                    file_index=file_index,
+                    child_index=child_index,
+                    file_summaries=file_summaries,
+                    children_abstracts=children_abstracts,
+                    pending=pending,
+                    pending_snapshot=pending_snapshot,
+                    sampled_children_dirs=sampled_children_dirs,
+                    sampled_file_paths=sampled_file_paths,
+                    dispatched=True,
+                )
+                self._nodes[dir_uri] = node
+                for file_path in sorted(required_file_paths):
+                    self._schedule_file(dir_uri, file_path)
+                for child_uri in sorted(required_children_dirs):
+                    self._schedule_dir(child_uri, dir_uri)
+                if pending == 0:
+                    self._schedule_overview(dir_uri)
+                return False
             # Recursive/initial work still maintains every file. Incremental
             # parent aggregation prepares only sampled inputs plus files that
             # changed and therefore need their own vector maintenance.
@@ -488,7 +647,7 @@ class SemanticDagExecutor:
             return False
         except Exception as e:
             logger.error(f"Failed to dispatch directory {dir_uri}: {e}", exc_info=True)
-            if self._generation_trigger == "content_copy":
+            if self._semantic_plan is not None or self._generation_trigger == "content_copy":
                 raise
             if parent_uri:
                 await self._on_child_done(parent_uri, dir_uri, "")
@@ -586,6 +745,8 @@ class SemanticDagExecutor:
 
     async def _list_dir(self, uri: str, from_hint: str) -> tuple[list[str], list[str]]:
         """List directory entries and return (child_dirs, file_paths)."""
+        if self._semantic_plan is not None:
+            return self._plan_children.get(uri.rstrip("/"), ([], []))
         if self._artifact_files and self._root_uri:
             return self._list_artifact_dir(uri)
         try:
@@ -669,7 +830,7 @@ class SemanticDagExecutor:
         return current_uri
 
     def _is_direct_incremental_update(self) -> bool:
-        return (
+        return self._semantic_plan is not None or (
             self._incremental_update
             and self._changes_provided
             and self._target_uri == self._root_uri
@@ -692,6 +853,27 @@ class SemanticDagExecutor:
         if self._generation_trigger == "content_write":
             return IngestOptions()
         return self._ingest_options
+
+    def _plan_scalar_override(self, uri: str, level: int) -> Optional[Dict[str, Any]]:
+        entry = self._plan_entries_by_uri.get(uri.rstrip("/"))
+        if entry is None:
+            return None
+        record = next(
+            (candidate for candidate in entry.indexed_records if candidate.level == level),
+            None,
+        )
+        if record is None:
+            return None
+        values = {
+            "type": record.type,
+            "created_at": record.created_at,
+            "active_count": record.active_count,
+            "name": record.name,
+            "description": record.description,
+            "tags": record.tags,
+            "search_tags": list(record.search_tags) if record.search_tags is not None else None,
+        }
+        return {key: value for key, value in values.items() if value is not None}
 
     async def _check_file_content_changed(self, file_path: str) -> bool:
         if self._is_direct_incremental_update():
@@ -786,10 +968,20 @@ class SemanticDagExecutor:
             if self._directory_entries_changed(dir_uri):
                 return True
             for current_file in current_files:
-                if self._file_change_status.get(current_file, True):
+                default_changed = (
+                    self._plan_entries_by_uri[current_file].state != "unchanged"
+                    if self._semantic_plan is not None
+                    else True
+                )
+                if self._file_change_status.get(current_file, default_changed):
                     return True
             for current_dir in current_dirs:
-                if self._dir_change_status.get(current_dir, True):
+                default_changed = (
+                    self._plan_entries_by_uri[current_dir].state != "unchanged"
+                    if self._semantic_plan is not None
+                    else True
+                )
+                if self._dir_change_status.get(current_dir, default_changed):
                     return True
             return False
 
@@ -821,6 +1013,13 @@ class SemanticDagExecutor:
     async def _read_existing_overview_abstract(
         self, dir_uri: str
     ) -> tuple[Optional[str], Optional[str]]:
+        if self._semantic_plan is not None:
+            entry = self._plan_entries_by_uri.get(dir_uri.rstrip("/"))
+            if entry is None:
+                return None, None
+            overview = self._entry_record_abstract(entry, 1) or None
+            abstract = self._entry_record_abstract(entry, 0) or None
+            return overview, abstract
         target_path = self._get_target_file_path(dir_uri)
         if not target_path:
             return None, None
@@ -917,18 +1116,46 @@ class SemanticDagExecutor:
                     if file_content is not None
                     else self._file_md5s.get(file_path.rstrip("/")) or None
                 )
-                await self._processor._vectorize_single_file(
-                    parent_uri=parent_uri,
-                    context_type=self._context_type,
-                    file_path=file_path,
-                    summary_dict=summary_dict,
-                    ctx=self._ctx,
-                    use_summary=use_summary,
-                    ingest_options=self._ingest_options_for_file(file_path),
-                    creator_acl_grant=self._creator_acl_grant(file_path),
-                    file_md5=file_md5,
-                    **vectorize_kwargs,
+                entry = self._plan_entries_by_uri.get(file_path.rstrip("/"))
+                old_l2 = (
+                    next((record for record in entry.indexed_records if record.level == 2), None)
+                    if entry is not None
+                    else None
                 )
+                summary_unchanged = bool(
+                    self._semantic_plan is not None
+                    and self._semantic_plan.file_vector_source
+                    is FileVectorSource.SUMMARY_WHEN_AVAILABLE
+                    and old_l2 is not None
+                    and old_l2.abstract
+                    and str(summary_dict.get("summary") or "") == old_l2.abstract
+                )
+                if summary_unchanged:
+                    await self._processor._update_file_vector_fields(
+                        record_id=old_l2.record_id,
+                        file_path=file_path,
+                        file_md5=file_md5,
+                        file_content=file_content,
+                        ctx=self._ctx,
+                    )
+                else:
+                    if self._semantic_plan is not None:
+                        vectorize_kwargs["scalar_override"] = self._plan_scalar_override(
+                            file_path, 2
+                        )
+                        vectorize_kwargs["partial_update"] = False
+                    await self._processor._vectorize_single_file(
+                        parent_uri=parent_uri,
+                        context_type=self._context_type,
+                        file_path=file_path,
+                        summary_dict=summary_dict,
+                        ctx=self._ctx,
+                        use_summary=use_summary,
+                        ingest_options=self._ingest_options_for_file(file_path),
+                        creator_acl_grant=self._creator_acl_grant(file_path),
+                        file_md5=file_md5,
+                        **vectorize_kwargs,
+                    )
             except Exception as e:
                 logger.error(
                     "Failed to schedule vectorization for %s: %s",
@@ -1081,7 +1308,8 @@ class SemanticDagExecutor:
                 missing_summary_entries=missing_summary_entries,
             ),
         }
-        if dir_uri == self._root_uri and self._source:
+        source_root = self._semantic_resource_root or self._root_uri
+        if dir_uri == source_root and self._source:
             metadata["source"] = self._source
         wrote = await write_abstract_overview(
             viking_fs=self._viking_fs,
@@ -1198,6 +1426,16 @@ class SemanticDagExecutor:
             if need_vectorize and not self._skip_vectorization:
                 assert overview is not None and abstract is not None
                 try:
+                    directory_vector_kwargs: Dict[str, Any] = {}
+                    if self._semantic_plan is not None:
+                        directory_vector_kwargs = {
+                            "scalar_overrides": {
+                                level: values
+                                for level in (0, 1)
+                                if (values := self._plan_scalar_override(dir_uri, level))
+                            },
+                            "partial_update": False,
+                        }
                     await self._processor._vectorize_directory(
                         dir_uri,
                         context_type=self._context_type,
@@ -1206,6 +1444,7 @@ class SemanticDagExecutor:
                         ctx=self._ctx,
                         ingest_options=self._ingest_options_for_directory(),
                         creator_acl_grant=self._creator_acl_grant(dir_uri),
+                        **directory_vector_kwargs,
                     )
                 except Exception as e:
                     logger.error(

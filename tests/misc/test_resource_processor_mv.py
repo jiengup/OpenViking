@@ -70,6 +70,9 @@ class _FakePathLock:
     async def pathlock_release(self, lease):
         pass
 
+    async def pathlock_handoff(self, lease):
+        pass
+
 
 class _FakeVikingFS:
     def __init__(self, *, exists_result=False, existing_uris=None, pathlock=None):
@@ -85,6 +88,9 @@ class _FakeVikingFS:
 
     def bind_request_context(self, ctx):
         return _CtxMgr()
+
+    async def _ensure_access(self, uri, ctx, action):
+        return None
 
     async def exists(self, uri, ctx=None):
         self.exists_calls.append(uri)
@@ -178,6 +184,117 @@ async def test_resource_processor_rejects_directory_when_every_file_failed(monke
     assert fake_fs.delete_temp_calls == [("viking://temp/empty-directory", None)]
     assert fake_fs.persist_calls == []
     rp.tree_builder.finalize_from_temp.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_resource_processor_rejects_partial_directory_before_semantic_plan_diff(
+    monkeypatch,
+):
+    from openviking.parse.output import ParseArtifactRef
+    from openviking.utils.resource_processor import ResourceProcessor
+
+    fake_fs = _FakeVikingFS(exists_result=True)
+    monkeypatch.setattr(
+        "openviking.utils.resource_processor.get_current_telemetry",
+        lambda: _DummyTelemetry(),
+    )
+    _patch_viking_fs(monkeypatch, fake_fs)
+
+    ref = ParseArtifactRef(backend="agfs", root="viking://temp/partial")
+    parse_result = SimpleNamespace(
+        temp_dir_path=ref.root,
+        source_path="repo",
+        source_format="repository",
+        meta={
+            "file_count": 1,
+            "total_processable": 2,
+            "processed_files": [{"path": "kept.py"}],
+            "failed_files": [
+                {
+                    "path": "missing.py",
+                    "parser": "native",
+                    "error": "parser failed",
+                }
+            ],
+        },
+        warnings=[],
+        artifact_ref=ref,
+        ensure_artifact_ref=lambda: ref,
+    )
+    rp = ResourceProcessor(vikingdb=_DummyVikingDB(), media_storage=None)
+    rp._get_media_processor = MagicMock()
+    rp._get_media_processor.return_value.process = AsyncMock(return_value=parse_result)
+    rp.tree_builder.finalize_from_temp = AsyncMock(
+        side_effect=AssertionError("partial artifact must not reach finalize/diff")
+    )
+
+    result = await rp.process_resource(path="repo", ctx=object(), build_index=True)
+
+    assert result["status"] == "error"
+    assert result["errors"] == [
+        "Directory import incomplete: 1 file(s) failed to parse; "
+        "failed files: missing.py: parser failed"
+    ]
+    assert fake_fs.delete_temp_calls == [(ref.root, None)]
+    rp.tree_builder.finalize_from_temp.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_partial_directory_rejection_cleans_local_parse_artifact(monkeypatch, tmp_path):
+    from openviking.parse.output import LocalParseOutputStore
+    from openviking.utils.resource_processor import ResourceProcessor
+
+    fake_fs = _FakeVikingFS(exists_result=True)
+    monkeypatch.setattr(
+        "openviking.utils.resource_processor.get_current_telemetry",
+        lambda: _DummyTelemetry(),
+    )
+    _patch_viking_fs(monkeypatch, fake_fs)
+
+    store = LocalParseOutputStore(local_root=str(tmp_path / "artifacts"))
+    ref = await store.create_artifact()
+    await store.write_bytes(ref, "repo/kept.py", b"pass")
+    parse_result = SimpleNamespace(
+        temp_dir_path=ref.root,
+        source_path="repo",
+        source_format="repository",
+        meta={
+            "file_count": 1,
+            "total_processable": 2,
+            "processed_files": [{"path": "kept.py"}],
+            "failed_files": [{"path": "missing.py", "error": "failed"}],
+        },
+        warnings=[],
+        artifact_ref=ref,
+        ensure_artifact_ref=lambda: ref,
+    )
+    rp = ResourceProcessor(vikingdb=_DummyVikingDB(), media_storage=None)
+    rp._build_parse_output_store = MagicMock(return_value=store)
+    rp._get_media_processor = MagicMock()
+    rp._get_media_processor.return_value.process = AsyncMock(return_value=parse_result)
+    rp.tree_builder.finalize_from_temp = AsyncMock()
+
+    result = await rp.process_resource(path="repo", ctx=object(), build_index=True)
+
+    assert result["status"] == "error"
+    assert not tmp_path.joinpath("artifacts", ref.root.split("/")[-1]).exists()
+    assert fake_fs.delete_temp_calls == []
+    rp.tree_builder.finalize_from_temp.assert_not_awaited()
+
+
+def test_directory_parse_failures_exclude_source_access_skips():
+    from openviking.utils.resource_processor import ResourceProcessor
+
+    failures = ResourceProcessor._directory_parse_failures(
+        {
+            "failed_files": [
+                {"path": "broken.pdf", "error": "invalid PDF"},
+                {"path": "denied.docx", "reason": "HTTP 403"},
+            ]
+        }
+    )
+
+    assert failures == [{"path": "broken.pdf", "error": "invalid PDF"}]
 
 
 @pytest.mark.parametrize("length", [119, 120, 121, 240])
@@ -295,6 +412,70 @@ async def test_resource_processor_first_add_summarizes_from_committed_uri(monkey
     assert fake_fs.delete_temp_calls == [("viking://temp/tmpdir", None)]
     assert summarize_calls[0]["temp_uris"] == ["viking://resources/root"]
     assert summarize_calls[0]["target_preexisting"] is False
+
+
+@pytest.mark.asyncio
+async def test_directory_semantic_ingest_commits_plan_before_summarizer(monkeypatch):
+    from openviking.parse.output import ParseArtifactRef
+    from openviking.storage.queuefs.semantic_plan import (
+        SemanticPlan,
+        SemanticTreeEntry,
+        SemanticTreeSnapshot,
+    )
+    from openviking.storage.resource_diff_apply import ApplyResult
+    from openviking.utils.resource_processor import ResourceProcessor
+
+    fake_fs = _FakeVikingFS()
+    monkeypatch.setattr(
+        "openviking.utils.resource_processor.get_current_telemetry",
+        lambda: _DummyTelemetry(),
+    )
+    _patch_viking_fs(monkeypatch, fake_fs)
+    ref = ParseArtifactRef(
+        backend="agfs",
+        root="viking://temp/tmpdir",
+        resource_rel="root_tmp",
+    )
+    parse_result = SimpleNamespace(
+        temp_dir_path=ref.root,
+        source_path="x",
+        source_format="repository",
+        meta={},
+        warnings=[],
+        artifact_ref=ref,
+        ensure_artifact_ref=lambda: ref,
+    )
+    plan = SemanticPlan(
+        root_uri="viking://resources/root",
+        context_type="resource",
+        tree=SemanticTreeSnapshot(entries=(SemanticTreeEntry("a.py", "file", "added", md5="a"),)),
+    )
+    rp = ResourceProcessor(vikingdb=_DummyVikingDB(), media_storage=None)
+    rp._get_media_processor = MagicMock()
+    rp._get_media_processor.return_value.process = AsyncMock(return_value=parse_result)
+    rp.tree_builder.finalize_from_temp = AsyncMock(
+        return_value=SimpleNamespace(
+            root=SimpleNamespace(
+                uri="viking://resources/root",
+                temp_uri="viking://temp/tmpdir/root_tmp",
+            ),
+            _root_is_file=False,
+        )
+    )
+    rp._commit_directory_artifact_with_plan = AsyncMock(
+        return_value=(ApplyResult(added=["a.py"], files=["a.py"]), plan)
+    )
+    summarize = AsyncMock(return_value={"status": "success", "enqueued_count": 1})
+    rp._summarizer = SimpleNamespace(summarize=summarize)
+
+    result = await rp.process_resource(path="x", ctx=object(), build_index=True)
+
+    assert result["status"] == "success"
+    assert fake_fs.persist_calls == []
+    kwargs = summarize.await_args.kwargs
+    assert SemanticPlan.from_dict(kwargs["semantic_plan"]) == plan
+    assert kwargs["temp_uris"] == ["viking://resources/root"]
+    assert kwargs["artifact_ref"] is None
 
 
 @pytest.mark.asyncio

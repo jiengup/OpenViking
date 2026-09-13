@@ -8,6 +8,11 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from openviking.server.identity import RequestContext, Role
+from openviking.storage.queuefs.semantic_plan import (
+    SemanticPlan,
+    SemanticTreeEntry,
+    SemanticTreeSnapshot,
+)
 from openviking.utils.ingest_options import IngestOptions
 from openviking.utils.resource_processor import ResourceProcessor
 from openviking_cli.session.user_id import UserIdentifier
@@ -224,6 +229,209 @@ async def test_local_incremental_noop_skips_semantic_queue_and_releases_resource
     summarizer.summarize.assert_not_awaited()
     viking_fs._async_agfs.pathlock_release.assert_awaited_once_with(lock)
     assert not tmp_path.joinpath(ref.root).exists()
+
+
+@pytest.mark.asyncio
+async def test_directory_semantic_plan_is_enqueued_without_artifact_or_legacy_diff(
+    monkeypatch, ctx
+):
+    root_uri = "viking://resources/demo"
+    plan = SemanticPlan(
+        root_uri=root_uri,
+        context_type="resource",
+        tree=SemanticTreeSnapshot(
+            entries=(SemanticTreeEntry("a.py", "file", "modified", md5="new"),)
+        ),
+    )
+    viking_fs = SimpleNamespace(
+        _async_agfs=SimpleNamespace(
+            pathlock_to_handoff=AsyncMock(return_value={"lease": "x"}),
+            pathlock_handoff=AsyncMock(),
+            pathlock_release=AsyncMock(),
+        )
+    )
+    monkeypatch.setattr("openviking.utils.resource_processor.get_viking_fs", lambda: viking_fs)
+    processor = ResourceProcessor(_FakeVikingDB())
+    summarizer = SimpleNamespace(
+        summarize=AsyncMock(return_value={"status": "success", "enqueued_count": 1})
+    )
+    processor._get_summarizer = Mock(return_value=summarizer)
+
+    await processor.finish_prepared_resource(
+        {
+            "root_uri": root_uri,
+            "temp_uri": root_uri,
+            "source_committed": True,
+            "target_preexisting": True,
+            "root_is_file": False,
+            "semantic_plan": plan.to_dict(),
+        },
+        ctx=ctx,
+        resource_lock={"lease_ref": "plan"},
+        build_index=True,
+        processing_mode="semantic_and_vectors",
+    )
+
+    kwargs = summarizer.summarize.await_args.kwargs
+    assert SemanticPlan.from_dict(kwargs["semantic_plan"]) == plan
+    assert kwargs["temp_uris"] == [root_uri]
+    assert kwargs.get("changes") is None
+    assert kwargs.get("artifact_ref") is None
+
+
+@pytest.mark.asyncio
+async def test_plan_artifact_is_cleaned_only_after_semantic_enqueue(monkeypatch, ctx, tmp_path):
+    from openviking.parse.output import LocalParseOutputStore
+
+    root_uri = "viking://resources/demo"
+    store = LocalParseOutputStore(local_root=str(tmp_path / "artifacts"))
+    ref = await store.create_artifact()
+    await store.write_bytes(ref, "repository/a.py", b"a")
+    plan = SemanticPlan(
+        root_uri=root_uri,
+        context_type="resource",
+        tree=SemanticTreeSnapshot(entries=(SemanticTreeEntry("a.py", "file", "added", md5="a"),)),
+    )
+    lock = {"lease_ref": "plan"}
+    viking_fs = SimpleNamespace(
+        _async_agfs=SimpleNamespace(
+            pathlock_handoff=AsyncMock(),
+            pathlock_release=AsyncMock(),
+        )
+    )
+    monkeypatch.setattr("openviking.utils.resource_processor.get_viking_fs", lambda: viking_fs)
+    processor = ResourceProcessor(_FakeVikingDB())
+    processor._build_parse_output_store = Mock(return_value=store)
+
+    async def summarize(**kwargs):
+        assert kwargs["artifact_ref"] is None
+        assert tmp_path.joinpath("artifacts", ref.root.split("/")[-1]).exists()
+        return {"status": "success", "enqueued_count": 1}
+
+    processor._get_summarizer = Mock(
+        return_value=SimpleNamespace(summarize=AsyncMock(side_effect=summarize))
+    )
+
+    await processor.finish_prepared_resource(
+        {
+            "root_uri": root_uri,
+            "temp_uri": root_uri,
+            "source_committed": True,
+            "target_preexisting": True,
+            "root_is_file": False,
+            "artifact_ref": ref.to_dict(),
+            "semantic_plan": plan.to_dict(),
+            "plan_artifact_committed": True,
+        },
+        ctx=ctx,
+        resource_lock=lock,
+        build_index=True,
+    )
+
+    assert not tmp_path.joinpath("artifacts", ref.root.split("/")[-1]).exists()
+    viking_fs._async_agfs.pathlock_handoff.assert_awaited_once_with(lock)
+
+
+@pytest.mark.asyncio
+async def test_plan_enqueue_failure_cleans_artifact_and_releases_lock(monkeypatch, ctx, tmp_path):
+    from openviking.parse.output import LocalParseOutputStore
+
+    root_uri = "viking://resources/demo"
+    store = LocalParseOutputStore(local_root=str(tmp_path / "artifacts"))
+    ref = await store.create_artifact()
+    await store.write_bytes(ref, "repository/a.py", b"a")
+    plan = SemanticPlan(
+        root_uri=root_uri,
+        context_type="resource",
+        tree=SemanticTreeSnapshot(entries=(SemanticTreeEntry("a.py", "file", "added", md5="a"),)),
+    )
+    lock = {"lease_ref": "plan"}
+    viking_fs = SimpleNamespace(
+        _async_agfs=SimpleNamespace(
+            pathlock_handoff=AsyncMock(),
+            pathlock_release=AsyncMock(),
+        )
+    )
+    monkeypatch.setattr("openviking.utils.resource_processor.get_viking_fs", lambda: viking_fs)
+    processor = ResourceProcessor(_FakeVikingDB())
+    processor._build_parse_output_store = Mock(return_value=store)
+    processor._get_summarizer = Mock(
+        return_value=SimpleNamespace(
+            summarize=AsyncMock(side_effect=RuntimeError("queue unavailable"))
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="queue unavailable"):
+        await processor.finish_prepared_resource(
+            {
+                "root_uri": root_uri,
+                "temp_uri": root_uri,
+                "source_committed": True,
+                "target_preexisting": True,
+                "root_is_file": False,
+                "artifact_ref": ref.to_dict(),
+                "semantic_plan": plan.to_dict(),
+                "plan_artifact_committed": True,
+            },
+            ctx=ctx,
+            resource_lock=lock,
+            build_index=True,
+        )
+
+    assert not tmp_path.joinpath("artifacts", ref.root.split("/")[-1]).exists()
+    viking_fs._async_agfs.pathlock_handoff.assert_not_awaited()
+    viking_fs._async_agfs.pathlock_release.assert_awaited_once_with(lock)
+
+
+@pytest.mark.asyncio
+async def test_plan_enqueue_error_result_cleans_artifact_and_fails(monkeypatch, ctx, tmp_path):
+    from openviking.parse.output import LocalParseOutputStore
+
+    root_uri = "viking://resources/demo"
+    store = LocalParseOutputStore(local_root=str(tmp_path / "artifacts"))
+    ref = await store.create_artifact()
+    await store.write_bytes(ref, "repository/a.py", b"a")
+    plan = SemanticPlan(
+        root_uri=root_uri,
+        context_type="resource",
+        tree=SemanticTreeSnapshot(entries=(SemanticTreeEntry("a.py", "file", "added", md5="a"),)),
+    )
+    lock = {"lease_ref": "plan"}
+    viking_fs = SimpleNamespace(
+        _async_agfs=SimpleNamespace(
+            pathlock_handoff=AsyncMock(),
+            pathlock_release=AsyncMock(),
+        )
+    )
+    monkeypatch.setattr("openviking.utils.resource_processor.get_viking_fs", lambda: viking_fs)
+    processor = ResourceProcessor(_FakeVikingDB())
+    processor._build_parse_output_store = Mock(return_value=store)
+    processor._get_summarizer = Mock(
+        return_value=SimpleNamespace(
+            summarize=AsyncMock(return_value={"status": "error", "message": "queue rejected plan"})
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="queue rejected plan"):
+        await processor.finish_prepared_resource(
+            {
+                "root_uri": root_uri,
+                "temp_uri": root_uri,
+                "source_committed": True,
+                "target_preexisting": True,
+                "root_is_file": False,
+                "artifact_ref": ref.to_dict(),
+                "semantic_plan": plan.to_dict(),
+                "plan_artifact_committed": True,
+            },
+            ctx=ctx,
+            resource_lock=lock,
+            build_index=True,
+        )
+
+    assert not tmp_path.joinpath("artifacts", ref.root.split("/")[-1]).exists()
+    viking_fs._async_agfs.pathlock_handoff.assert_not_awaited()
+    viking_fs._async_agfs.pathlock_release.assert_awaited_once_with(lock)
 
 
 @pytest.mark.asyncio

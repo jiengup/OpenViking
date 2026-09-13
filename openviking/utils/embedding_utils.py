@@ -69,7 +69,10 @@ _PORTABLE_SCALAR_FIELDS = frozenset(
         "name",
         "description",
         "tags",
+        "search_tags",
         "abstract",
+        "created_at",
+        "active_count",
     }
 )
 
@@ -90,10 +93,20 @@ def _apply_ingest_options(
     ingest_options = IngestOptions.from_value(ingest_options)
     if not embedding_msg or ingest_options.search_tags is None:
         return
-    embedding_msg.context_data["search_tags"] = list(ingest_options.search_tags or [])
-    embedding_msg.context_data["_upsert_options"] = {
-        "search_tag_mode": ingest_options.search_tag_mode
-    }
+    incoming_tags = list(ingest_options.search_tags or [])
+    if (
+        ingest_options.search_tag_mode == "append"
+        and embedding_msg.context_data.get("_upsert_options", {}).get("partial_update") is False
+    ):
+        from openviking.utils.tags import merge_search_tags
+
+        incoming_tags = merge_search_tags(
+            embedding_msg.context_data.get("search_tags"), incoming_tags
+        )
+    embedding_msg.context_data["search_tags"] = incoming_tags
+    embedding_msg.context_data.setdefault("_upsert_options", {})["search_tag_mode"] = (
+        ingest_options.search_tag_mode
+    )
 
 
 async def _enqueue_embedding_message(
@@ -370,6 +383,7 @@ async def vectorize_directory_meta(
     ingest_options: IngestOptions | None = None,
     creator_acl_grant: CreatorAclGrant | None = None,
     include_abstract: bool = True,
+    partial_update: bool = True,
 ) -> None:
     """
     Vectorize directory metadata (.abstract.md and .overview.md).
@@ -418,13 +432,15 @@ async def vectorize_directory_meta(
             context_abstract.set_vectorize(
                 Vectorize(text=embedding_text_for_body(ContextLevel.ABSTRACT, uri, abstract))
             )
-            msg_abstract = EmbeddingMsgConverter.from_context(
-                context_abstract, creator_acl_grant
-            )
+            msg_abstract = EmbeddingMsgConverter.from_context(context_abstract, creator_acl_grant)
             _apply_scalar_overrides(
                 msg_abstract,
                 (scalar_overrides or {}).get(int(ContextLevel.ABSTRACT.value)),
             )
+            if msg_abstract and not partial_update:
+                msg_abstract.context_data.setdefault("_upsert_options", {})["partial_update"] = (
+                    partial_update
+                )
             _apply_ingest_options(msg_abstract, ingest_options)
             if msg_abstract:
                 try:
@@ -465,13 +481,15 @@ async def vectorize_directory_meta(
             context_overview.set_vectorize(
                 Vectorize(text=embedding_text_for_body(ContextLevel.OVERVIEW, uri, overview))
             )
-            msg_overview = EmbeddingMsgConverter.from_context(
-                context_overview, creator_acl_grant
-            )
+            msg_overview = EmbeddingMsgConverter.from_context(context_overview, creator_acl_grant)
             _apply_scalar_overrides(
                 msg_overview,
                 (scalar_overrides or {}).get(int(ContextLevel.OVERVIEW.value)),
             )
+            if msg_overview and not partial_update:
+                msg_overview.context_data.setdefault("_upsert_options", {})["partial_update"] = (
+                    partial_update
+                )
             _apply_ingest_options(msg_overview, ingest_options)
             if msg_overview:
                 try:
@@ -515,6 +533,7 @@ async def vectorize_file(
     creator_acl_grant: CreatorAclGrant | None = None,
     file_md5: Optional[str] = None,
     file_content: Optional[bytes] = None,
+    partial_update: bool = True,
 ) -> bool:
     """
     Vectorize a single file.
@@ -651,6 +670,8 @@ async def vectorize_file(
             return False
 
         _apply_scalar_overrides(embedding_msg, scalar_override)
+        if not partial_update:
+            embedding_msg.context_data.setdefault("_upsert_options", {})["partial_update"] = False
         _apply_ingest_options(embedding_msg, ingest_options)
         enqueued = await _enqueue_embedding_message(
             embedding_queue,

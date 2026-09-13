@@ -16,6 +16,12 @@ from openviking.storage.abstract_overview import (
     render_abstract_overview,
 )
 from openviking.storage.queuefs.semantic_dag import SemanticDagExecutor
+from openviking.storage.queuefs.semantic_plan import (
+    IndexedRecordSnapshot,
+    SemanticPlan,
+    SemanticTreeEntry,
+    SemanticTreeSnapshot,
+)
 from openviking.utils.content_hash import content_md5
 from openviking.utils.ingest_options import IngestOptions
 from openviking_cli.session.user_id import UserIdentifier
@@ -84,6 +90,7 @@ class _FakeProcessor:
         self.directory_ingest_options = {}
         self.vectorized_dirs = []
         self.generated_overviews = []
+        self.updated_file_vectors = []
 
     def _parse_overview_md(self, overview_content):
         results = {}
@@ -137,12 +144,15 @@ class _FakeProcessor:
         creator_acl_grant=None,
         file_md5=None,
         file_content=None,
+        scalar_override=None,
+        partial_update=True,
     ):
         del creator_acl_grant
         self.vectorized_files.append(file_path)
         self.file_ingest_options[file_path] = ingest_options
         self.file_md5s[file_path] = file_md5
         self.file_contents[("vector", file_path)] = file_content
+        self.file_contents[("partial_update", file_path)] = partial_update
 
     async def _vectorize_directory(
         self,
@@ -153,11 +163,27 @@ class _FakeProcessor:
         ctx=None,
         ingest_options=None,
         creator_acl_grant=None,
+        scalar_overrides=None,
+        partial_update=True,
     ):
         del creator_acl_grant
         self.directory_ingest_options[uri] = ingest_options
         self.vectorized_dirs.append(uri)
+        self.file_contents[("partial_update", uri)] = partial_update
         return None
+
+    async def _update_file_vector_fields(
+        self, *, record_id, file_path, file_md5, file_content, ctx
+    ):
+        self.updated_file_vectors.append(
+            {
+                "record_id": record_id,
+                "file_path": file_path,
+                "file_md5": file_md5,
+                "file_content": file_content,
+                "ctx": ctx,
+            }
+        )
 
     async def _sync_topdown_recursive(
         self, root_uri, target_uri, ctx=None, file_change_status=None, lock=None
@@ -176,6 +202,353 @@ class _FakeProcessor:
             added_dirs=[],
             deleted_dirs=[],
         )
+
+
+@pytest.mark.asyncio
+async def test_plan_dag_uses_manifest_adjacency_without_listing_unchanged_subtrees(monkeypatch):
+    root_uri = "viking://resources/repo"
+    src_uri = f"{root_uri}/src"
+    changed_uri = f"{src_uri}/a.py"
+    fake_fs = _FakeVikingFS(
+        tree={},
+        file_contents={
+            changed_uri: "changed body",
+            f"{src_uri}/.overview.md": "old overview",
+            f"{src_uri}/.abstract.md": "old abstract",
+        },
+    )
+    fake_fs.ls = AsyncMock(side_effect=AssertionError("plan DAG must not list storage"))
+    monkeypatch.setattr("openviking.storage.queuefs.semantic_dag.get_viking_fs", lambda: fake_fs)
+    monkeypatch.setattr(
+        "openviking.storage.queuefs.semantic_dag.get_openviking_config",
+        lambda: SimpleNamespace(semantic=SimpleNamespace(overview_sample_limit=32)),
+    )
+    plan = SemanticPlan(
+        root_uri=root_uri,
+        context_type="resource",
+        tree=SemanticTreeSnapshot(
+            entries=(
+                SemanticTreeEntry(relative_path="src", kind="directory", state="unchanged"),
+                SemanticTreeEntry(
+                    relative_path="src/a.py",
+                    kind="file",
+                    state="modified",
+                    md5="new-a",
+                    indexed_records=(
+                        IndexedRecordSnapshot(
+                            record_id="a-l2", level=2, abstract="old-a", md5="old-a"
+                        ),
+                    ),
+                ),
+                SemanticTreeEntry(
+                    relative_path="src/b.py",
+                    kind="file",
+                    state="unchanged",
+                    md5="same-b",
+                    indexed_records=(
+                        IndexedRecordSnapshot(record_id="b-l2", level=2, abstract="old-b"),
+                    ),
+                ),
+                SemanticTreeEntry(
+                    relative_path="src/utils",
+                    kind="directory",
+                    state="unchanged",
+                    indexed_records=(
+                        IndexedRecordSnapshot(
+                            record_id="utils-l0", level=0, abstract="utils abstract"
+                        ),
+                    ),
+                ),
+            )
+        ),
+    )
+    processor = _FakeProcessor(fake_fs)
+    executor = SemanticDagExecutor(
+        processor=processor,
+        context_type="resource",
+        max_concurrent_llm=2,
+        ctx=RequestContext(user=UserIdentifier("acc1", "user1"), role=Role.USER),
+        semantic_plan=plan,
+    )
+
+    await executor.run(src_uri)
+
+    fake_fs.ls.assert_not_awaited()
+    assert processor.summarized_files == [changed_uri]
+    assert processor.generated_overviews == [src_uri]
+    assert processor.file_contents[("partial_update", changed_uri)] is False
+    assert processor.file_contents[("partial_update", src_uri)] is False
+    overview = parse_abstract_overview(fake_fs._file_contents[f"{src_uri}/.overview.md"]).body
+    assert "- b.py: old-b" in overview
+    assert "- utils/: utils abstract" in overview
+
+
+@pytest.mark.asyncio
+async def test_code_plan_same_abstract_updates_scalars_without_reembedding(monkeypatch):
+    root_uri = "viking://resources/repo"
+    file_uri = f"{root_uri}/a.py"
+    fake_fs = _FakeVikingFS(tree={}, file_contents={file_uri: "changed body"})
+    fake_fs.ls = AsyncMock(side_effect=AssertionError("plan DAG must not list storage"))
+    monkeypatch.setattr("openviking.storage.queuefs.semantic_dag.get_viking_fs", lambda: fake_fs)
+    monkeypatch.setattr(
+        "openviking.storage.queuefs.semantic_dag.get_openviking_config",
+        lambda: SimpleNamespace(semantic=SimpleNamespace(overview_sample_limit=32)),
+    )
+    plan = SemanticPlan(
+        root_uri=root_uri,
+        context_type="resource",
+        tree=SemanticTreeSnapshot(
+            entries=(
+                SemanticTreeEntry(
+                    relative_path="",
+                    kind="directory",
+                    state="unchanged",
+                    indexed_records=(
+                        IndexedRecordSnapshot(record_id="root-l0", level=0, abstract="old"),
+                        IndexedRecordSnapshot(record_id="root-l1", level=1, abstract="old"),
+                    ),
+                ),
+                SemanticTreeEntry(
+                    relative_path="a.py",
+                    kind="file",
+                    state="modified",
+                    md5="new-md5",
+                    indexed_records=(
+                        IndexedRecordSnapshot(
+                            record_id="a-l2", level=2, abstract="summary", md5="old-md5"
+                        ),
+                    ),
+                ),
+            )
+        ),
+        file_vector_source="summary_when_available",
+    )
+    processor = _FakeProcessor(fake_fs)
+    executor = SemanticDagExecutor(
+        processor=processor,
+        context_type="resource",
+        max_concurrent_llm=2,
+        ctx=RequestContext(user=UserIdentifier("acc1", "user1"), role=Role.USER),
+        semantic_plan=plan,
+    )
+
+    await executor.run(root_uri)
+
+    assert processor.vectorized_files == []
+    assert len(processor.updated_file_vectors) == 1
+    update = processor.updated_file_vectors[0]
+    assert update["record_id"] == "a-l2"
+    assert update["file_md5"] == content_md5(b"changed body")
+    assert update["file_content"] == b"changed body"
+    assert processor.generated_overviews == []
+
+
+@pytest.mark.asyncio
+async def test_nested_code_plan_same_abstract_does_not_read_or_rewrite_directory_sidecars(
+    monkeypatch,
+):
+    root_uri = "viking://resources/repo"
+    child_uri = f"{root_uri}/src"
+    file_uri = f"{child_uri}/a.py"
+    fake_fs = _FakeVikingFS(tree={}, file_contents={file_uri: "changed body"})
+    fake_fs.ls = AsyncMock(side_effect=AssertionError("plan DAG must not list storage"))
+    monkeypatch.setattr("openviking.storage.queuefs.semantic_dag.get_viking_fs", lambda: fake_fs)
+    monkeypatch.setattr(
+        "openviking.storage.queuefs.semantic_dag.get_openviking_config",
+        lambda: SimpleNamespace(semantic=SimpleNamespace(overview_sample_limit=32)),
+    )
+    plan = SemanticPlan(
+        root_uri=root_uri,
+        context_type="resource",
+        tree=SemanticTreeSnapshot(
+            entries=(
+                SemanticTreeEntry(
+                    relative_path="src",
+                    kind="directory",
+                    state="unchanged",
+                    indexed_records=(
+                        IndexedRecordSnapshot(record_id="src-l0", level=0, abstract="old"),
+                        IndexedRecordSnapshot(record_id="src-l1", level=1, abstract="old"),
+                    ),
+                ),
+                SemanticTreeEntry(
+                    relative_path="src/a.py",
+                    kind="file",
+                    state="modified",
+                    md5="new-md5",
+                    indexed_records=(
+                        IndexedRecordSnapshot(record_id="a-l2", level=2, abstract="summary"),
+                    ),
+                ),
+                SemanticTreeEntry(
+                    relative_path="src/b.py",
+                    kind="file",
+                    state="unchanged",
+                    indexed_records=(
+                        IndexedRecordSnapshot(record_id="b-l2", level=2, abstract="old-b"),
+                    ),
+                ),
+                SemanticTreeEntry(
+                    relative_path="src/utils",
+                    kind="directory",
+                    state="unchanged",
+                    indexed_records=(
+                        IndexedRecordSnapshot(record_id="utils-l0", level=0, abstract="utils"),
+                    ),
+                ),
+            )
+        ),
+        file_vector_source="summary_when_available",
+    )
+    processor = _FakeProcessor(fake_fs)
+
+    await SemanticDagExecutor(
+        processor=processor,
+        context_type="resource",
+        max_concurrent_llm=2,
+        ctx=RequestContext(user=UserIdentifier("acc1", "user1"), role=Role.USER),
+        semantic_plan=plan,
+    ).run(child_uri)
+
+    assert processor.generated_overviews == []
+    assert fake_fs.writes == []
+
+
+@pytest.mark.asyncio
+async def test_plan_missing_unchanged_dependency_fails_closed(monkeypatch):
+    root_uri = "viking://resources/repo"
+    fake_fs = _FakeVikingFS(tree={}, file_contents={f"{root_uri}/a.py": "changed"})
+    fake_fs.ls = AsyncMock(side_effect=AssertionError("plan DAG must not list storage"))
+    monkeypatch.setattr("openviking.storage.queuefs.semantic_dag.get_viking_fs", lambda: fake_fs)
+    monkeypatch.setattr(
+        "openviking.storage.queuefs.semantic_dag.get_openviking_config",
+        lambda: SimpleNamespace(semantic=SimpleNamespace(overview_sample_limit=32)),
+    )
+    plan = SemanticPlan(
+        root_uri=root_uri,
+        context_type="resource",
+        tree=SemanticTreeSnapshot(
+            entries=(
+                SemanticTreeEntry("", "directory", "unchanged"),
+                SemanticTreeEntry("a.py", "file", "modified", md5="new"),
+                SemanticTreeEntry("b.py", "file", "unchanged", md5="same"),
+            )
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="lacks L2 abstract"):
+        await SemanticDagExecutor(
+            processor=_FakeProcessor(fake_fs),
+            context_type="resource",
+            max_concurrent_llm=2,
+            ctx=RequestContext(user=UserIdentifier("acc1", "user1"), role=Role.USER),
+            semantic_plan=plan,
+        ).run(root_uri)
+
+
+@pytest.mark.asyncio
+async def test_plan_file_summary_error_skips_node(monkeypatch):
+    root_uri = "viking://resources/repo"
+    fake_fs = _FakeVikingFS(tree={}, file_contents={f"{root_uri}/a.py": "changed"})
+    monkeypatch.setattr("openviking.storage.queuefs.semantic_dag.get_viking_fs", lambda: fake_fs)
+    monkeypatch.setattr(
+        "openviking.storage.queuefs.semantic_dag.get_openviking_config",
+        lambda: SimpleNamespace(semantic=SimpleNamespace(overview_sample_limit=32)),
+    )
+    processor = _FakeProcessor(fake_fs)
+    processor._generate_single_file_summary = AsyncMock(side_effect=RuntimeError("LLM failed"))
+    plan = SemanticPlan(
+        root_uri=root_uri,
+        context_type="resource",
+        tree=SemanticTreeSnapshot(
+            entries=(
+                SemanticTreeEntry("", "directory", "unchanged"),
+                SemanticTreeEntry("a.py", "file", "modified", md5="new"),
+            )
+        ),
+    )
+
+    await SemanticDagExecutor(
+        processor=processor,
+        context_type="resource",
+        max_concurrent_llm=2,
+        ctx=RequestContext(user=UserIdentifier("acc1", "user1"), role=Role.USER),
+        semantic_plan=plan,
+    ).run(root_uri)
+
+    assert processor.vectorized_files == [f"{root_uri}/a.py"]
+
+
+@pytest.mark.asyncio
+async def test_plan_directory_summary_error_skips_node(monkeypatch):
+    root_uri = "viking://resources/repo"
+    file_uri = f"{root_uri}/a.py"
+    fake_fs = _FakeVikingFS(tree={}, file_contents={file_uri: "changed"})
+    monkeypatch.setattr("openviking.storage.queuefs.semantic_dag.get_viking_fs", lambda: fake_fs)
+    monkeypatch.setattr(
+        "openviking.storage.queuefs.semantic_dag.get_openviking_config",
+        lambda: SimpleNamespace(semantic=SimpleNamespace(overview_sample_limit=32)),
+    )
+    processor = _FakeProcessor(fake_fs)
+    processor._generate_overview = AsyncMock(side_effect=RuntimeError("LLM failed"))
+    plan = SemanticPlan(
+        root_uri=root_uri,
+        context_type="resource",
+        tree=SemanticTreeSnapshot(
+            entries=(
+                SemanticTreeEntry("", "directory", "unchanged"),
+                SemanticTreeEntry("a.py", "file", "modified", md5="new"),
+            )
+        ),
+    )
+
+    await SemanticDagExecutor(
+        processor=processor,
+        context_type="resource",
+        max_concurrent_llm=2,
+        ctx=RequestContext(user=UserIdentifier("acc1", "user1"), role=Role.USER),
+        semantic_plan=plan,
+    ).run(root_uri)
+
+    assert processor.vectorized_files == [file_uri]
+    assert processor.vectorized_dirs == []
+    assert fake_fs.writes == []
+
+
+def test_plan_acl_grants_inherit_on_first_import_and_direct_on_incremental(monkeypatch):
+    root_uri = "viking://resources/repo"
+    first_plan = SemanticPlan(
+        root_uri=root_uri,
+        context_type="resource",
+        tree=SemanticTreeSnapshot(
+            entries=(
+                SemanticTreeEntry("", "directory", "added"),
+                SemanticTreeEntry("a.py", "file", "added", md5="a"),
+            )
+        ),
+    )
+    incremental_plan = SemanticPlan(
+        root_uri=root_uri,
+        context_type="resource",
+        tree=SemanticTreeSnapshot(
+            entries=(
+                SemanticTreeEntry("", "directory", "unchanged"),
+                SemanticTreeEntry("b.py", "file", "added", md5="b"),
+            )
+        ),
+    )
+    ctx = RequestContext(user=UserIdentifier("acc1", "user1"), role=Role.USER)
+    fake_fs = _FakeVikingFS(tree={}, file_contents={})
+    monkeypatch.setattr("openviking.storage.queuefs.semantic_dag.get_viking_fs", lambda: fake_fs)
+
+    first = SemanticDagExecutor(_FakeProcessor(None), "resource", 1, ctx, semantic_plan=first_plan)
+    incremental = SemanticDagExecutor(
+        _FakeProcessor(None), "resource", 1, ctx, semantic_plan=incremental_plan
+    )
+
+    assert first._creator_acl_grant(root_uri).value == "direct"
+    assert first._creator_acl_grant(f"{root_uri}/a.py").value == "inherited"
+    assert incremental._creator_acl_grant(f"{root_uri}/b.py").value == "direct"
 
 
 @pytest.mark.asyncio

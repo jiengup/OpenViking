@@ -4,6 +4,12 @@ from unittest.mock import AsyncMock
 import pytest
 
 from openviking.storage.queuefs.semantic_msg import SemanticMsg
+from openviking.storage.queuefs.semantic_plan import (
+    SemanticPlan,
+    SemanticTreeEntry,
+    SemanticTreeSnapshot,
+    VectorRecordRef,
+)
 from openviking.storage.queuefs.semantic_processor import SemanticProcessor
 from openviking.storage.viking_fs import SyncDiff
 
@@ -123,6 +129,106 @@ async def test_target_source_syncs_before_semantic_dag(monkeypatch):
     }
     assert _FakeDagExecutor.runs == ["viking://resources/org/repo"]
     processor._cleanup_local_artifact.assert_awaited_once_with(msg)
+
+
+@pytest.mark.asyncio
+async def test_semantic_plan_skips_sync_and_runs_only_minimal_roots(monkeypatch):
+    monkeypatch.setattr(
+        "openviking.storage.queuefs.semantic_processor.get_viking_fs",
+        lambda: _FakeVikingFS(),
+    )
+    monkeypatch.setattr(
+        "openviking.storage.queuefs.semantic_processor.SemanticDagExecutor",
+        _FakeDagExecutor,
+    )
+    monkeypatch.setattr(
+        "openviking.storage.queuefs.semantic_processor.SemanticLockScope.resolve",
+        AsyncMock(return_value=SimpleNamespace(lock=None, close=AsyncMock())),
+    )
+    plan = SemanticPlan(
+        root_uri="viking://resources/repo",
+        context_type="resource",
+        tree=SemanticTreeSnapshot(
+            entries=(
+                SemanticTreeEntry("src", "directory", "unchanged"),
+                SemanticTreeEntry("src/a.py", "file", "modified", md5="a"),
+                SemanticTreeEntry("docs", "directory", "unchanged"),
+                SemanticTreeEntry("docs/b.md", "file", "modified", md5="b"),
+            )
+        ),
+        orphan_vector_deletes=(
+            VectorRecordRef(
+                record_id="ghost-l2",
+                uri="viking://resources/repo/ghost.py",
+                level=2,
+            ),
+        ),
+    )
+    _FakeDagExecutor.calls = []
+    _FakeDagExecutor.runs = []
+    processor = SemanticProcessor()
+    processor._sync_topdown_recursive = AsyncMock(
+        side_effect=AssertionError("plan path must not sync")
+    )
+    processor._enqueue_plan_vector_deletes = AsyncMock()
+    processor._enqueue_parent_refresh = AsyncMock()
+    msg = SemanticMsg(
+        uri=plan.root_uri,
+        context_type="resource",
+        plan_version=1,
+        plan=plan,
+    )
+
+    await processor.on_dequeue(msg.to_dict())
+
+    processor._sync_topdown_recursive.assert_not_awaited()
+    processor._enqueue_plan_vector_deletes.assert_awaited_once_with(msg, plan)
+    assert _FakeDagExecutor.runs == [
+        "viking://resources/repo/docs",
+        "viking://resources/repo/src",
+    ]
+    assert all(call["semantic_plan"] == plan for call in _FakeDagExecutor.calls)
+
+
+@pytest.mark.asyncio
+async def test_plan_added_entry_deletes_every_stale_record(monkeypatch):
+    from openviking.storage.queuefs.semantic_plan import IndexedRecordSnapshot
+
+    queue = SimpleNamespace(enqueue=AsyncMock(return_value="queued"))
+    manager = SimpleNamespace(
+        EMBEDDING="embedding",
+        get_queue=lambda *_args, **_kwargs: queue,
+    )
+    monkeypatch.setattr(
+        "openviking.storage.queuefs.get_queue_manager",
+        lambda: manager,
+    )
+    plan = SemanticPlan(
+        root_uri="viking://resources/repo",
+        context_type="resource",
+        tree=SemanticTreeSnapshot(
+            entries=(
+                SemanticTreeEntry(
+                    "a.py",
+                    "file",
+                    "added",
+                    md5="new",
+                    indexed_records=(IndexedRecordSnapshot("stale-l2", 2),),
+                ),
+            )
+        ),
+    )
+    msg = SemanticMsg(
+        uri=plan.root_uri,
+        context_type="resource",
+        plan_version=1,
+        plan=plan,
+    )
+
+    await SemanticProcessor()._enqueue_plan_vector_deletes(msg, plan)
+
+    queued = queue.enqueue.await_args.args[0]
+    assert queued.record_ids == ["stale-l2"]
 
 
 @pytest.mark.asyncio

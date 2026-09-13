@@ -10,6 +10,8 @@ from uuid import uuid4
 
 from openviking.utils.ingest_options import IngestOptions
 
+from .semantic_plan import SemanticPlan
+
 
 def build_semantic_coalesce_key(
     *,
@@ -80,6 +82,8 @@ class SemanticMsg:
     artifact_ref: Optional[Dict[str, Any]] = None
     artifact_files: List[str] = field(default_factory=list)
     file_abstracts: Dict[str, str] = field(default_factory=dict)
+    plan_version: Optional[int] = None
+    plan: Optional[SemanticPlan] = None
 
     def __init__(
         self,
@@ -111,6 +115,8 @@ class SemanticMsg:
         artifact_ref: Optional[Dict[str, Any]] = None,
         artifact_files: Optional[List[str]] = None,
         file_abstracts: Optional[Dict[str, str]] = None,
+        plan_version: Optional[int] = None,
+        plan: SemanticPlan | Dict[str, Any] | None = None,
     ):
         self.id = str(uuid4())
         self.timestamp = int(datetime.now().timestamp())
@@ -142,6 +148,18 @@ class SemanticMsg:
         self.artifact_ref = dict(artifact_ref) if artifact_ref else None
         self.artifact_files = list(artifact_files or [])
         self.file_abstracts = dict(file_abstracts or {})
+        self.plan_version = int(plan_version) if plan_version is not None else None
+        self.plan = (
+            plan
+            if isinstance(plan, SemanticPlan)
+            else SemanticPlan.from_dict(plan)
+            if isinstance(plan, dict)
+            else None
+        )
+        if self.plan is not None and self.plan_version != 1:
+            raise ValueError("semantic plan_version must be 1 when plan is present")
+        if self.plan is None and self.plan_version is not None:
+            raise ValueError("semantic plan is required when plan_version is set")
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert object to dictionary."""
@@ -201,24 +219,18 @@ class SemanticMsg:
             use_hierarchical_aggregation=data.get("use_hierarchical_aggregation", False),
             propagate_to_parent=data.get("propagate_to_parent", True),
             copy_source_uri=data.get("copy_source_uri", ""),
-            file_md5s=(
-                data.get("file_md5s") if isinstance(data.get("file_md5s"), dict) else None
-            ),
+            file_md5s=(data.get("file_md5s") if isinstance(data.get("file_md5s"), dict) else None),
             artifact_ref=(
-                data.get("artifact_ref")
-                if isinstance(data.get("artifact_ref"), dict)
-                else None
+                data.get("artifact_ref") if isinstance(data.get("artifact_ref"), dict) else None
             ),
             artifact_files=(
-                data.get("artifact_files")
-                if isinstance(data.get("artifact_files"), list)
-                else None
+                data.get("artifact_files") if isinstance(data.get("artifact_files"), list) else None
             ),
             file_abstracts=(
-                data.get("file_abstracts")
-                if isinstance(data.get("file_abstracts"), dict)
-                else None
+                data.get("file_abstracts") if isinstance(data.get("file_abstracts"), dict) else None
             ),
+            plan_version=data.get("plan_version"),
+            plan=data.get("plan") if isinstance(data.get("plan"), dict) else None,
         )
         if "id" in data and data["id"]:
             obj.id = data["id"]

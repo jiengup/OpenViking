@@ -20,7 +20,9 @@ from typing import List, Mapping
 
 # Control sidecars / metadata that are derived outputs, never business files.
 # They must not enter the business diff or they would be classified as deletions.
-_CONTROL_BASENAMES = frozenset({".abstract.md", ".overview.md"})
+_CONTROL_BASENAMES = frozenset(
+    {".abstract.md", ".overview.md", ".image_mappings.json", ".artifact_manifest.json"}
+)
 
 
 @dataclass(frozen=True)
@@ -56,8 +58,10 @@ class DiffPlan:
     """
 
     added: List[str] = field(default_factory=list)
+    added_dirs: List[str] = field(default_factory=list)
     modified: List[str] = field(default_factory=list)
     deleted: List[str] = field(default_factory=list)
+    deleted_dirs: List[str] = field(default_factory=list)
     unchanged: List[str] = field(default_factory=list)
     repair: List[str] = field(default_factory=list)
     orphan_vectors: List[str] = field(default_factory=list)
@@ -114,11 +118,17 @@ def build_diff_plan(
             plan.structural.append(key)
             if not n.is_dir:
                 plan.added.append(key)
+            else:
+                plan.added_dirs.append(key)
             continue
 
         # Directories carry no legitimate L2 record. If one exists at the same
         # URI, clean that vector while children are classified on their own keys.
         if (n is not None and n.is_dir) or (f is not None and f.is_dir):
+            if n is not None and n.is_dir and f is None:
+                plan.added_dirs.append(key)
+            if n is None and f is not None and f.is_dir:
+                plan.deleted_dirs.append(key)
             if v is not None:
                 plan.orphan_vectors.append(key)
             continue
@@ -148,7 +158,7 @@ def build_diff_plan(
             # Index with no file and not in the new tree: orphan vector.
             plan.orphan_vectors.append(key)
 
-    if plan.deleted and not target_files_complete:
+    if (plan.deleted or plan.deleted_dirs) and not target_files_complete:
         raise ValueError("refusing to plan deletions from an incomplete target file snapshot")
     if plan.orphan_vectors and not target_files_complete:
         raise ValueError(

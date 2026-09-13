@@ -28,6 +28,18 @@ from typing import Any, Dict, List
 from openviking.storage.viking_fs._diff_plan import DiffPlan
 from openviking.utils.content_hash import content_md5
 
+_CONTROL_BASENAMES = frozenset(
+    {".abstract.md", ".overview.md", ".image_mappings.json", ".artifact_manifest.json"}
+)
+
+
+def _is_business_file(rel_path: str) -> bool:
+    return rel_path.rsplit("/", 1)[-1] not in _CONTROL_BASENAMES
+
+
+def _covered_by_tree_delete(rel_path: str, roots: List[str]) -> bool:
+    return any(rel_path == root or rel_path.startswith(root.rstrip("/") + "/") for root in roots)
+
 
 @dataclass
 class ApplyResult:
@@ -35,9 +47,11 @@ class ApplyResult:
 
     uploaded: List[str] = field(default_factory=list)
     added: List[str] = field(default_factory=list)
+    added_dirs: List[str] = field(default_factory=list)
     modified: List[str] = field(default_factory=list)
     unchanged: List[str] = field(default_factory=list)
     deleted: List[str] = field(default_factory=list)
+    deleted_dirs: List[str] = field(default_factory=list)
     orphan_vectors: List[str] = field(default_factory=list)
     structural: List[str] = field(default_factory=list)
     repair: List[str] = field(default_factory=list)
@@ -64,6 +78,7 @@ async def apply_diff_plan(
     store: Any,
     artifact_ref: Any,
     target: Any,
+    delete_vectors: bool = True,
 ) -> ApplyResult:
     """Execute ``plan`` against ``target``, uploading only changed files.
 
@@ -77,17 +92,31 @@ async def apply_diff_plan(
         added=list(plan.added),
         modified=list(plan.modified),
         repair=list(plan.repair),
-        files=list(plan.new_files),
+        files=sorted(plan.new_files),
         md5_by_rel=dict(plan.new_md5s),
         abstracts_by_rel=dict(plan.file_abstracts),
     )
 
     # Structural replacements: delete the stale node up front. The replacement is
     # written by its added/modified classification below.
-    for rel_path in plan.structural:
+    structural_roots = sorted(
+        plan.structural,
+        key=lambda value: (value.count("/"), value),
+    )
+    structural_roots = [
+        path
+        for index, path in enumerate(structural_roots)
+        if not _covered_by_tree_delete(path, structural_roots[:index])
+    ]
+    for rel_path in structural_roots:
         await target.delete_file(rel_path)
-        await target.delete_vector(rel_path)
+        if delete_vectors:
+            await target.delete_vector(rel_path)
         result.structural.append(rel_path)
+
+    for rel_path in sorted(plan.added_dirs, key=lambda value: (value.count("/"), value)):
+        await target.mkdir(rel_path)
+        result.added_dirs.append(rel_path)
 
     for rel_path in [*plan.added, *plan.modified]:
         await _upload(
@@ -109,15 +138,40 @@ async def apply_diff_plan(
         result.modified.append(rel_path)
         result.md5_by_rel[rel_path] = content_md5(final_bytes)
 
+    for rel_path in plan.repair:
+        new_bytes = await store.read_bytes(artifact_ref, rel_path)
+        try:
+            old_bytes = await target.read_file(rel_path)
+        except Exception:
+            old_bytes = None
+        if old_bytes is not None and old_bytes == new_bytes:
+            result.md5_by_rel.setdefault(rel_path, content_md5(new_bytes))
+            continue
+        written = await target.write_file(rel_path, new_bytes)
+        final_bytes = written if written is not None else new_bytes
+        result.uploaded.append(rel_path)
+        result.md5_by_rel[rel_path] = content_md5(final_bytes)
+
     result.unchanged.extend(plan.unchanged)
 
     for rel_path in plan.deleted:
-        await target.delete_file(rel_path)
-        await target.delete_vector(rel_path)
+        if not _covered_by_tree_delete(rel_path, structural_roots):
+            await target.delete_file(rel_path)
+        if delete_vectors:
+            await target.delete_vector(rel_path)
         result.deleted.append(rel_path)
 
+    deleted_dir_roots: List[str] = []
+    for rel_path in sorted(plan.deleted_dirs, key=lambda value: (value.count("/"), value)):
+        if _covered_by_tree_delete(rel_path, [*structural_roots, *deleted_dir_roots]):
+            continue
+        deleted_dir_roots.append(rel_path)
+        await target.delete_file(rel_path)
+        result.deleted_dirs.append(rel_path)
+
     for rel_path in plan.orphan_vectors:
-        await target.delete_vector(rel_path)
+        if delete_vectors:
+            await target.delete_vector(rel_path)
         result.orphan_vectors.append(rel_path)
 
     return result
@@ -152,12 +206,19 @@ async def apply_full_artifact_upload(
         result.md5_by_rel[""] = content_md5(final_bytes)
         return result
 
+    directories: set[str] = set()
+
     async def _walk(rel: str) -> None:
         for entry in await store.list(artifact_ref, rel):
             if entry.is_dir:
+                target_rel = entry.rel_path[len(prefix) :] if prefix else entry.rel_path
+                if target_rel:
+                    directories.add(target_rel)
                 await _walk(entry.rel_path)
                 continue
             target_rel = entry.rel_path[len(prefix) :] if prefix else entry.rel_path
+            if not _is_business_file(target_rel):
+                continue
             data = await store.read_bytes(artifact_ref, entry.rel_path)
             written = await target.write_file(target_rel, data)
             final_bytes = written if written is not None else data
@@ -166,6 +227,9 @@ async def apply_full_artifact_upload(
             result.md5_by_rel[target_rel] = content_md5(final_bytes)
 
     await _walk(base)
+    for rel_path in sorted(directories, key=lambda value: (value.count("/"), value)):
+        await target.mkdir(rel_path)
+        result.added_dirs.append(rel_path)
     result.files.sort()
     return result
 

@@ -106,20 +106,16 @@ class ParseOutputStore(ABC):
         """Allocate a fresh artifact root and return its reference."""
 
     @abstractmethod
-    async def mkdir(self, ref: ParseArtifactRef, rel_path: str = "") -> None:
-        ...
+    async def mkdir(self, ref: ParseArtifactRef, rel_path: str = "") -> None: ...
 
     @abstractmethod
-    async def write_bytes(self, ref: ParseArtifactRef, rel_path: str, content: bytes) -> None:
-        ...
+    async def write_bytes(self, ref: ParseArtifactRef, rel_path: str, content: bytes) -> None: ...
 
     @abstractmethod
-    async def read_bytes(self, ref: ParseArtifactRef, rel_path: str) -> bytes:
-        ...
+    async def read_bytes(self, ref: ParseArtifactRef, rel_path: str) -> bytes: ...
 
     @abstractmethod
-    async def list(self, ref: ParseArtifactRef, rel_path: str = "") -> List[ArtifactEntry]:
-        ...
+    async def list(self, ref: ParseArtifactRef, rel_path: str = "") -> List[ArtifactEntry]: ...
 
     @abstractmethod
     async def cleanup(self, ref: ParseArtifactRef) -> None:
@@ -146,8 +142,9 @@ class AgfsParseOutputStore(ParseOutputStore):
 
     backend = "agfs"
 
-    def __init__(self, viking_fs: Any = None) -> None:
+    def __init__(self, viking_fs: Any = None, ctx: Any = None) -> None:
         self._viking_fs = viking_fs
+        self._ctx = ctx
         self._cleaned: set[str] = set()
 
     def _fs(self) -> Any:
@@ -167,21 +164,28 @@ class AgfsParseOutputStore(ParseOutputStore):
     async def create_artifact(self, *, root_type: str = "dir") -> ParseArtifactRef:
         if root_type not in _ROOT_TYPES:
             raise ValueError(f"root_type must be one of {sorted(_ROOT_TYPES)}")
-        root = self._fs().create_temp_uri()
+        root = self._fs().create_temp_uri(ctx=self._ctx)
         return ParseArtifactRef(backend=self.backend, root=root, root_type=root_type)
 
     async def mkdir(self, ref: ParseArtifactRef, rel_path: str = "") -> None:
-        await self._fs().mkdir(self._resolve(ref, rel_path), exist_ok=True)
+        await self._fs().mkdir(self._resolve(ref, rel_path), exist_ok=True, ctx=self._ctx)
 
     async def write_bytes(self, ref: ParseArtifactRef, rel_path: str, content: bytes) -> None:
-        await self._fs().write_file_bytes(self._resolve(ref, rel_path), content)
+        await self._fs().write_file_bytes(self._resolve(ref, rel_path), content, ctx=self._ctx)
 
     async def read_bytes(self, ref: ParseArtifactRef, rel_path: str) -> bytes:
-        return await self._fs().read_file_bytes(self._resolve(ref, rel_path))
+        return await self._fs().read_file_bytes(self._resolve(ref, rel_path), ctx=self._ctx)
 
     async def list(self, ref: ParseArtifactRef, rel_path: str = "") -> List[ArtifactEntry]:
+        from openviking.storage.viking_fs import LS_ALL_NODES
+
         base = self._resolve(ref, rel_path)
-        entries = await self._fs().ls(base)
+        entries = await self._fs().ls(
+            base,
+            show_all_hidden=True,
+            node_limit=LS_ALL_NODES,
+            ctx=self._ctx,
+        )
         rel_prefix = (rel_path or "").strip("/")
         result: List[ArtifactEntry] = []
         for entry in entries:
@@ -202,7 +206,7 @@ class AgfsParseOutputStore(ParseOutputStore):
         if ref.root in self._cleaned:
             return
         self._cleaned.add(ref.root)
-        await self._fs().delete_temp(ref.root)
+        await self._fs().delete_temp(ref.root, ctx=self._ctx)
 
 
 class LocalParseOutputStore(ParseOutputStore):
@@ -346,9 +350,7 @@ async def resolve_artifact_doc_root(
     root_is_file = False
 
     if flatten_single_file:
-        children = [
-            e for e in await store.list(ref, doc_rel) if e.name not in {".", ".."}
-        ]
+        children = [e for e in await store.list(ref, doc_rel) if e.name not in {".", ".."}]
         if len(children) == 1 and not children[0].is_dir:
             doc_name = children[0].name
             doc_rel = children[0].rel_path

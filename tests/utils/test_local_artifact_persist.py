@@ -39,6 +39,9 @@ class _RecordingAgfs:
     async def write_file_bytes(self, uri, content, *, ctx=None, lease_ref=None):
         self.files[uri] = content
 
+    async def mkdir(self, uri, exist_ok=False, ctx=None, lease_ref=None):
+        del exist_ok, ctx, lease_ref
+
     async def read_file_bytes(self, uri, *, ctx=None):
         return self.files[uri]
 

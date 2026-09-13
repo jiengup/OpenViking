@@ -125,6 +125,7 @@ class Summarizer:
         artifact_ref = kwargs.get("artifact_ref")
         artifact_files = kwargs.get("artifact_files") or []
         file_abstracts = kwargs.get("file_abstracts") or {}
+        semantic_plan = kwargs.get("semantic_plan")
         if not temp_uris:
             temp_uris = resource_uris
         if len(temp_uris) != len(resource_uris):
@@ -214,6 +215,8 @@ class Summarizer:
                     artifact_ref=artifact_ref,
                     artifact_files=artifact_files,
                     file_abstracts=file_abstracts,
+                    plan_version=1 if semantic_plan is not None else None,
+                    plan=semantic_plan,
                 )
                 if msg.telemetry_id:
                     get_request_wait_tracker().register_semantic_root(msg.telemetry_id, msg.id)

@@ -20,6 +20,7 @@ Assembling the plan then delegates to :func:`build_diff_plan`.
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from typing import Any, Dict, Tuple
 
 from openviking.core.namespace import uri_parts
@@ -33,7 +34,17 @@ from openviking.storage.viking_fs._diff_plan import (
 )
 from openviking_cli.utils import VikingURI
 
-_CONTROL_BASENAMES = frozenset({".abstract.md", ".overview.md"})
+_CONTROL_BASENAMES = frozenset(
+    {".abstract.md", ".overview.md", ".image_mappings.json", ".artifact_manifest.json"}
+)
+
+
+@dataclass(frozen=True)
+class ResourceDiffSnapshot:
+    new: Dict[str, NewEntry]
+    target_files: Dict[str, TargetFile]
+    vector_inventory: Dict[str, Dict[str, Any]]
+    plan: DiffPlan
 
 
 def _is_excluded_rel_path(rel_path: str) -> bool:
@@ -161,6 +172,9 @@ async def read_new_manifest(
             if _is_excluded_rel_path(entry.rel_path):
                 continue
             if entry.is_dir:
+                key = entry.rel_path[len(prefix) :] if prefix else entry.rel_path
+                if key:
+                    manifest[key] = NewEntry(is_dir=True)
                 await _walk(entry.rel_path)
                 continue
             key = entry.rel_path[len(prefix) :] if prefix else entry.rel_path
@@ -213,8 +227,55 @@ async def build_resource_diff_plan(
     )
 
 
+async def build_resource_diff_snapshot(
+    *,
+    viking_fs: Any,
+    vikingdb: Any,
+    store: Any,
+    artifact_ref: Any,
+    target_uri: str,
+    ctx: Any,
+    doc_rel: str = "",
+    require_vectors: bool = True,
+) -> ResourceDiffSnapshot:
+    """Read a complete directory N/F/V snapshot and build its DiffPlan."""
+    new = await read_new_manifest(store, artifact_ref, doc_rel=doc_rel)
+    target_files, files_complete = await read_target_file_snapshot(viking_fs, target_uri, ctx=ctx)
+    inventory = await vikingdb.get_incremental_inventory_under_uri(target_uri, ctx=ctx)
+    base = target_uri.rstrip("/")
+    prefix = base + "/"
+    target_vectors: Dict[str, TargetVector] = {}
+    for record in inventory.values():
+        if int(record.get("level", -1)) != 2:
+            continue
+        uri = str(record.get("uri") or "")
+        rel = "" if uri == base else uri[len(prefix) :] if uri.startswith(prefix) else None
+        if rel is None:
+            raise RuntimeError(f"Vector inventory returned an out-of-scope URI: {uri}")
+        target_vectors[rel] = TargetVector(md5=str(record.get("md5") or ""))
+    if not require_vectors:
+        for rel_path, target_file in target_files.items():
+            if not target_file.is_dir:
+                target_vectors.setdefault(rel_path, TargetVector())
+    plan = build_diff_plan(
+        new=new,
+        target_files=target_files,
+        target_vectors=target_vectors,
+        target_files_complete=files_complete,
+        target_vectors_complete=True,
+    )
+    return ResourceDiffSnapshot(
+        new=new,
+        target_files=target_files,
+        vector_inventory=inventory,
+        plan=plan,
+    )
+
+
 __all__ = [
     "build_resource_diff_plan",
+    "build_resource_diff_snapshot",
+    "ResourceDiffSnapshot",
     "read_new_manifest",
     "read_target_file_snapshot",
     "read_target_vector_snapshot",

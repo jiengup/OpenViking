@@ -25,6 +25,7 @@ class _FakeVikingFS:
         self.dirs: list[str] = []
         self.deleted: list[str] = []
         self._temp_seq = 0
+        self.ls_kwargs = []
 
     def create_temp_uri(self, ctx=None) -> str:
         self._temp_seq += 1
@@ -40,6 +41,7 @@ class _FakeVikingFS:
         return self.files[uri]
 
     async def ls(self, uri: str, ctx=None, **kwargs) -> list[dict]:
+        self.ls_kwargs.append(kwargs)
         prefix = f"{uri.rstrip('/')}/"
         entries = []
         for stored in self.files:
@@ -156,6 +158,25 @@ class TestParseOutputStoreContract:
 
 @pytest.mark.asyncio
 class TestAgfsParseOutputStore:
+    async def test_explicit_context_is_forwarded(self) -> None:
+        class _ContextVikingFS(_FakeVikingFS):
+            def __init__(self):
+                super().__init__()
+                self.contexts = []
+
+            async def read_file_bytes(self, uri: str, ctx=None) -> bytes:
+                self.contexts.append(ctx)
+                return await super().read_file_bytes(uri, ctx=ctx)
+
+        ctx = object()
+        vfs = _ContextVikingFS()
+        store = AgfsParseOutputStore(viking_fs=vfs, ctx=ctx)
+        ref = await store.create_artifact(root_type="dir")
+        await store.write_bytes(ref, "a.py", b"a")
+
+        assert await store.read_bytes(ref, "a.py") == b"a"
+        assert vfs.contexts == [ctx]
+
     async def test_write_round_trips_through_vikingfs(self) -> None:
         vfs = _FakeVikingFS()
         store = AgfsParseOutputStore(viking_fs=vfs)
@@ -164,6 +185,17 @@ class TestAgfsParseOutputStore:
         await store.write_bytes(ref, "repo/main.py", b"print(1)")
 
         assert vfs.files["viking://temp/fake1/repo/main.py"] == b"print(1)"
+
+    async def test_list_requests_all_children(self) -> None:
+        from openviking.storage.viking_fs import LS_ALL_NODES
+
+        vfs = _FakeVikingFS()
+        store = AgfsParseOutputStore(viking_fs=vfs)
+        ref = await store.create_artifact(root_type="dir")
+
+        await store.list(ref)
+
+        assert vfs.ls_kwargs == [{"show_all_hidden": True, "node_limit": LS_ALL_NODES}]
 
     async def test_cleanup_deletes_via_vikingfs(self) -> None:
         vfs = _FakeVikingFS()

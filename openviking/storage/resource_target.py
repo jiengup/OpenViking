@@ -57,6 +57,14 @@ class AgfsResourceTarget:
         )
         return final_bytes
 
+    async def mkdir(self, rel_path: str) -> None:
+        await self._viking_fs.mkdir(
+            self._resolve(rel_path),
+            exist_ok=True,
+            ctx=self._ctx,
+            lease_ref=self._lease_ref,
+        )
+
     async def read_file(self, rel_path: str) -> bytes:
         return await self._viking_fs.read_file_bytes(self._resolve(rel_path), ctx=self._ctx)
 

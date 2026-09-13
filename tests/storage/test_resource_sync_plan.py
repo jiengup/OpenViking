@@ -76,6 +76,15 @@ class TestDecisionTable:
         )
         assert plan.deleted == ["a.py"]
 
+    def test_removed_directory_is_explicitly_deleted(self) -> None:
+        plan = build_diff_plan(
+            new={},
+            target_files={"empty": _f(is_dir=True)},
+            target_vectors={},
+        )
+
+        assert plan.deleted_dirs == ["empty"]
+
     def test_index_present_file_absent_new_present_is_added_and_orphan(self) -> None:
         plan = build_diff_plan(
             new={"a.py": _n("m1")},
@@ -139,6 +148,15 @@ class TestDecisionTable:
         )
         assert plan.added == ["a.py"]
 
+    def test_new_empty_directory_is_explicitly_added(self) -> None:
+        plan = build_diff_plan(
+            new={"empty": _n("", is_dir=True)},
+            target_files={},
+            target_vectors={},
+        )
+
+        assert plan.added_dirs == ["empty"]
+
 
 class TestMissingMd5Fallback:
     def test_missing_side_md5_reported_for_body_compare(self) -> None:
@@ -171,6 +189,7 @@ class TestTypeConflicts:
         assert "a" in plan.structural
         assert plan.unchanged == []
         assert plan.modified == []
+        assert plan.added_dirs == ["a"]
 
     def test_dir_becomes_file_is_structural(self) -> None:
         plan = build_diff_plan(

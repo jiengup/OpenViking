@@ -550,6 +550,113 @@ async def test_l2_diff_scan_reads_every_page_under_target_directory():
 
 
 @pytest.mark.asyncio
+async def test_incremental_inventory_reads_all_semantic_levels_under_target():
+    root = "viking://resources/docs"
+    backend = _RealAclMemoryTransferBackend(
+        [
+            _record("root-l0", root, level=0, abstract="root abstract"),
+            _record("root-l1", root, level=1, abstract="root overview"),
+            _record("file-l2", f"{root}/a.py", level=2, md5="ma"),
+            _record("outside", "viking://resources/other.py", level=2),
+            _record(
+                "other-account",
+                f"{root}/private.py",
+                level=2,
+                account_id="other",
+            ),
+        ]
+    )
+
+    records = await backend.get_incremental_inventory_under_uri(root, ctx=_ctx(), batch_size=2)
+
+    assert records == {
+        "root-l0": {"id": "root-l0", "uri": root, "level": 0, "md5": ""},
+        "root-l1": {"id": "root-l1", "uri": root, "level": 1, "md5": ""},
+        "file-l2": {
+            "id": "file-l2",
+            "uri": f"{root}/a.py",
+            "level": 2,
+            "md5": "ma",
+        },
+    }
+    assert len(backend.scroll_filters) == 2
+
+
+@pytest.mark.asyncio
+async def test_incremental_hydration_uses_dsl_then_fetches_only_missing_ids():
+    root = "viking://resources/docs"
+    first = _record("root-l0", root, level=0, abstract="root abstract")
+    second = _record("file-l2", f"{root}/a.py", level=2, md5="ma")
+    backend = _MemoryTransferBackend([first, second])
+    backend._strict_transfer_page = AsyncMock(return_value=([dict(first)], None))
+    backend._strict_transfer_get = AsyncMock(return_value=[dict(second)])
+
+    records = await backend.hydrate_incremental_records(
+        {
+            "root-l0": {"uri": root, "level": 0},
+            "file-l2": {"uri": f"{root}/a.py", "level": 2},
+        },
+        ctx=_ctx(),
+    )
+
+    assert set(records) == {"root-l0", "file-l2"}
+    assert records["root-l0"]["abstract"] == "root abstract"
+    assert records["file-l2"]["md5"] == "ma"
+    backend._strict_transfer_get.assert_awaited_once_with(_ctx(), ["file-l2"])
+    query = backend._strict_transfer_page.await_args
+    assert query.args[1] == In("id", ["root-l0", "file-l2"])
+    assert "vector" not in query.kwargs["output_fields"]
+    assert "sparse_vector" not in query.kwargs["output_fields"]
+
+
+@pytest.mark.asyncio
+async def test_incremental_hydration_propagates_dsl_failure_without_fallback():
+    backend = _MemoryTransferBackend([])
+    backend._strict_transfer_page = AsyncMock(side_effect=RuntimeError("query failed"))
+    backend._strict_transfer_get = AsyncMock()
+
+    with pytest.raises(RuntimeError, match="query failed"):
+        await backend.hydrate_incremental_records(
+            {"file-l2": {"uri": "viking://resources/docs/a.py", "level": 2}},
+            ctx=_ctx(),
+        )
+
+    backend._strict_transfer_get.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_incremental_hydration_rejects_mismatched_record_identity():
+    root = "viking://resources/docs"
+    backend = _MemoryTransferBackend([])
+    backend._strict_transfer_page = AsyncMock(
+        return_value=(
+            [_record("file-l2", f"{root}/wrong.py", level=2)],
+            None,
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="identity mismatch"):
+        await backend.hydrate_incremental_records(
+            {"file-l2": {"uri": f"{root}/a.py", "level": 2}},
+            ctx=_ctx(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_incremental_hydration_returns_only_records_still_present():
+    backend = _MemoryTransferBackend([])
+    backend._strict_transfer_page = AsyncMock(return_value=([], None))
+    backend._strict_transfer_get = AsyncMock(return_value=[])
+
+    records = await backend.hydrate_incremental_records(
+        {"gone": {"uri": "viking://resources/docs/a.py", "level": 2}},
+        ctx=_ctx(),
+    )
+
+    assert records == {}
+
+
+@pytest.mark.asyncio
 async def test_l2_diff_scan_reads_real_local_backend(tmp_path):
     if not getattr(vectordb_engine, "PersistStore", None):
         pytest.skip("local persistent vectordb engine is not available in this environment")
@@ -599,6 +706,69 @@ async def test_l2_diff_scan_reads_real_local_backend(tmp_path):
             f"{root}/a.py": {"md5": "ma", "abstract": "A"},
             f"{root}/ghost.py": {"md5": "mg", "abstract": "G"},
         }
+    finally:
+        await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_incremental_inventory_and_hydration_read_real_local_backend(tmp_path):
+    if not getattr(vectordb_engine, "PersistStore", None):
+        pytest.skip("local persistent vectordb engine is not available in this environment")
+
+    root = "viking://resources/docs"
+    backend = VikingVectorIndexBackend(
+        config=VectorDBBackendConfig(
+            backend="local", name="context", dimension=4, path=str(tmp_path)
+        )
+    )
+    try:
+        assert await backend.create_collection(
+            "context", CollectionSchemas.context_collection("context", 4)
+        )
+        await backend.upsert_many(
+            [
+                _record(
+                    "root-l0",
+                    root,
+                    level=0,
+                    abstract="root abstract",
+                    vector=[0.1, 0.2, 0.3, 0.4],
+                    created_at="2026-08-20T00:00:00Z",
+                    updated_at="2026-08-20T00:00:00Z",
+                ),
+                _record(
+                    "root-l1",
+                    root,
+                    level=1,
+                    abstract="root overview",
+                    vector=[0.1, 0.2, 0.3, 0.4],
+                    created_at="2026-08-20T00:00:01Z",
+                    updated_at="2026-08-20T00:00:01Z",
+                ),
+                _record(
+                    "a-l2",
+                    f"{root}/a.py",
+                    md5="ma",
+                    abstract="A",
+                    vector=[0.1, 0.2, 0.3, 0.4],
+                    created_at="2026-08-20T00:00:02Z",
+                    updated_at="2026-08-20T00:00:02Z",
+                ),
+            ],
+            ctx=_ctx(),
+        )
+
+        inventory = await backend.get_incremental_inventory_under_uri(
+            root, ctx=_ctx(), batch_size=1
+        )
+        hydrated = await backend.hydrate_incremental_records(inventory, ctx=_ctx())
+
+        assert set(inventory) == {"root-l0", "root-l1", "a-l2"}
+        assert inventory["a-l2"]["md5"] == "ma"
+        assert hydrated["root-l0"]["abstract"] == "root abstract"
+        assert hydrated["a-l2"]["abstract"] == "A"
+        assert "vector" not in hydrated["a-l2"]
+        assert "sparse_vector" not in hydrated["a-l2"]
     finally:
         await backend.close()
 

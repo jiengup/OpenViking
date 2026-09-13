@@ -25,7 +25,7 @@ from openviking.storage.errors import (
     EmbeddingConfigurationError,
     EmbeddingRebuildRequiredError,
 )
-from openviking.storage.queuefs.embedding_msg import EmbeddingMsg
+from openviking.storage.queuefs.embedding_msg import EmbeddingMsg, EmbeddingOperation
 from openviking.storage.queuefs.named_queue import DequeueHandlerBase
 from openviking.storage.vector_ids import vector_record_id
 from openviking.storage.viking_vector_index_backend import (
@@ -486,7 +486,6 @@ class TextEmbeddingHandler(DequeueHandlerBase):
         config = get_openviking_config()
         self._collection_name = config.storage.vectordb.name
         self._vector_dim = config.embedding.dimension
-        self._initialize_embedder(config)
         breaker_cfg = config.embedding.circuit_breaker
         self._circuit_breaker = CircuitBreaker(
             failure_threshold=breaker_cfg.failure_threshold,
@@ -604,6 +603,33 @@ class TextEmbeddingHandler(DequeueHandlerBase):
             else inserted_data["abstract"][:VIKINGDB_CONTENT_MAX_SIZE]
         )
 
+    async def _apply_non_embedding_operation(
+        self,
+        embedding_msg: EmbeddingMsg,
+        ctx: RequestContext,
+    ) -> Dict[str, Any]:
+        if embedding_msg.operation is EmbeddingOperation.DELETE:
+            deleted_count = await self._vikingdb.strict_delete(
+                embedding_msg.record_ids,
+                ctx=ctx,
+            )
+            return {"deleted_count": deleted_count}
+
+        records = await self._vikingdb.get_strict(embedding_msg.record_ids, ctx=ctx)
+        if len(records) != 1:
+            raise RuntimeError(
+                f"update_fields target record is missing: {embedding_msg.record_ids[0]}"
+            )
+        updated_record = dict(records[0])
+        updated_record.update(embedding_msg.update_fields)
+        result = await self._vikingdb.update(updated_record, ctx=ctx)
+        if not result.ok:
+            raise RuntimeError(
+                result.error_message
+                or f"failed to update vector record: {embedding_msg.record_ids[0]}"
+            )
+        return updated_record
+
     async def on_dequeue(self, data: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         """Process dequeued message and add embedding vector(s)."""
         if not data:
@@ -618,11 +644,7 @@ class TextEmbeddingHandler(DequeueHandlerBase):
             inserted_data = embedding_msg.context_data
             account_id = inserted_data.get("account_id", "default")
             context_user = inserted_data.get("user") or {}
-            user_id = (
-                context_user.get("user_id")
-                or inserted_data.get("owner_user_id")
-                or "default"
-            )
+            user_id = context_user.get("user_id") or inserted_data.get("owner_user_id") or "default"
             user = UserIdentifier(account_id=account_id, user_id=user_id)
             ctx = RequestContext(user=user, role=Role.USER, bypass_acl=True)
             collector = resolve_telemetry(embedding_msg.telemetry_id)
@@ -635,6 +657,13 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                     self._record_request_success(embedding_msg)
                     report_success = True
                     return None
+
+                if embedding_msg.operation is not EmbeddingOperation.EMBED_AND_UPSERT:
+                    result = await self._apply_non_embedding_operation(embedding_msg, ctx)
+                    self._merge_request_stats(embedding_msg.telemetry_id, processed=1)
+                    self._record_request_success(embedding_msg)
+                    report_success = True
+                    return result
 
                 if not isinstance(embedding_msg.message, (str, list)):
                     logger.debug(
@@ -824,7 +853,7 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                 try:
                     raw_upsert_options = inserted_data.pop("_upsert_options", {})
                     upsert_options = normalize_upsert_options(
-                        {**raw_upsert_options, "partial_update": True}
+                        {"partial_update": True, **raw_upsert_options}
                     )
                     # Ensure vector DB has deterministic IDs per semantic layer.
                     uri = inserted_data.get("uri")

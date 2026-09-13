@@ -125,6 +125,10 @@ class CodeRepositoryParser(BaseParser):
         """
         start_time = time.time()
         source_path = Path(source)
+        output_store = kwargs.get("parse_output_store")
+        artifact_ref = None
+        viking_fs = None
+        temp_viking_uri = None
 
         # Check if source is already a local directory (should always be true)
         if not source_path.is_dir():
@@ -164,8 +168,6 @@ class CodeRepositoryParser(BaseParser):
             # threaded through kwargs) writes into that store on the local disk;
             # otherwise the legacy AGFS temp path is used. Either way the layout
             # is viking-temp-shaped: <root>/repository/...
-            output_store = kwargs.get("parse_output_store")
-            artifact_ref = None
             if output_store is not None:
                 artifact_ref = await output_store.create_artifact(root_type="dir")
                 temp_viking_uri = artifact_ref.root
@@ -180,7 +182,7 @@ class CodeRepositoryParser(BaseParser):
             logger.info(f"Uploading code repository artifacts to: {target_root_uri}")
 
             # 4. Upload to the artifact store (filtering on the fly)
-            file_count = await self._upload_directory(
+            file_count, upload_failures = await self._upload_directory(
                 local_dir,
                 "repository" if output_store is not None else target_root_uri,
                 viking_fs,
@@ -190,6 +192,13 @@ class CodeRepositoryParser(BaseParser):
                 output_store=output_store,
                 artifact_ref=artifact_ref,
             )
+            if upload_failures:
+                detail = "; ".join(upload_failures[:5])
+                if len(upload_failures) > 5:
+                    detail += f"; ... {len(upload_failures) - 5} more"
+                raise RuntimeError(
+                    f"Failed to upload {len(upload_failures)} repository file(s): {detail}"
+                )
 
             logger.info(f"Uploaded {file_count} files to {target_root_uri}")
 
@@ -234,6 +243,24 @@ class CodeRepositoryParser(BaseParser):
 
         except Exception as e:
             logger.error(f"Failed to parse repository {source}: {e}", exc_info=True)
+            if output_store is not None and artifact_ref is not None:
+                try:
+                    await output_store.cleanup(artifact_ref)
+                except Exception as cleanup_error:
+                    logger.warning(
+                        "Failed to clean repository parse artifact %s: %s",
+                        artifact_ref.root,
+                        cleanup_error,
+                    )
+            elif viking_fs is not None and temp_viking_uri:
+                try:
+                    await viking_fs.delete_temp(temp_viking_uri)
+                except Exception as cleanup_error:
+                    logger.warning(
+                        "Failed to clean repository temp artifact %s: %s",
+                        temp_viking_uri,
+                        cleanup_error,
+                    )
             # Use original URL for error case as well - still important for TreeBuilder
             # Even on failure, we want TreeBuilder to potentially get org/repo from the URL
             original_source = kwargs.get("original_source") or source_meta.get("original_source")
@@ -604,9 +631,9 @@ class CodeRepositoryParser(BaseParser):
         exclude: Optional[str] = None,
         output_store: Any = None,
         artifact_ref: Any = None,
-    ) -> int:
+    ) -> Tuple[int, List[str]]:
         """Recursively upload directory to the artifact store (AGFS or local)."""
-        count, _ = await upload_directory(
+        return await upload_directory(
             local_dir,
             viking_uri_base,
             viking_fs,
@@ -616,4 +643,3 @@ class CodeRepositoryParser(BaseParser):
             output_store=output_store,
             artifact_ref=artifact_ref,
         )
-        return count

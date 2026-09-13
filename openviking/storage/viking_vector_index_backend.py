@@ -19,6 +19,7 @@ from openviking.core.namespace import (
 from openviking.server.identity import RequestContext, Role
 from openviking.storage.acl import (
     ACL_CONTEXT_FIELDS,
+    ACL_GRANT_FIELDS,
     ACL_MODE_FIELD,
     AclAction,
     AclManager,
@@ -89,6 +90,29 @@ INCREMENTAL_DIFF_OUTPUT_FIELDS = [
     "level",
     "abstract",
     "md5",
+]
+
+INCREMENTAL_INVENTORY_OUTPUT_FIELDS = ["id", "uri", "level", "md5"]
+
+INCREMENTAL_HYDRATION_OUTPUT_FIELDS = [
+    "id",
+    "uri",
+    "type",
+    "context_type",
+    "created_at",
+    "updated_at",
+    "active_count",
+    "level",
+    "name",
+    "description",
+    "tags",
+    "search_tags",
+    "abstract",
+    "md5",
+    "account_id",
+    "owner_user_id",
+    ACL_MODE_FIELD,
+    *ACL_GRANT_FIELDS,
 ]
 
 VIKINGDB_CONTENT_MAX_SIZE = 1024 * 1024
@@ -1201,6 +1225,10 @@ class VikingVectorIndexBackend:
         backend = self._get_backend_for_context(ctx)
         return await backend.delete(ids)
 
+    async def strict_delete(self, ids: List[str], *, ctx: RequestContext) -> int:
+        """Delete exact record IDs without converting backend failures to success."""
+        return await self._get_backend_for_context(ctx).strict_delete(ids)
+
     async def exists(self, id: str, *, ctx: RequestContext) -> bool:
         backend = self._get_backend_for_context(ctx)
         return await backend.exists(id)
@@ -1813,6 +1841,160 @@ class VikingVectorIndexBackend:
             seen_cursors.add(next_cursor)
             cursor = next_cursor
         return records
+
+    async def get_incremental_inventory_under_uri(
+        self,
+        uri: str,
+        *,
+        ctx: RequestContext,
+        batch_size: int = 100,
+    ) -> Dict[str, Dict[str, Any]]:
+        """Strictly load lightweight L0/L1/L2 metadata below a resource root."""
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        canonical_uri = resolve_uri(uri).uri.rstrip("/")
+        scope = And(
+            [
+                Eq("account_id", ctx.account_id),
+                PathScope("uri", canonical_uri, depth=-1),
+                In("level", [0, 1, 2]),
+            ]
+        )
+        expected_count = await self._strict_transfer_count(ctx, scope)
+        records: Dict[str, Dict[str, Any]] = {}
+        cursor: Optional[str] = None
+        scanned_count = 0
+        seen_cursors: set[str] = set()
+        while True:
+            page, next_cursor = await self._strict_transfer_page(
+                ctx,
+                scope,
+                limit=batch_size,
+                cursor=cursor,
+                output_fields=INCREMENTAL_INVENTORY_OUTPUT_FIELDS,
+            )
+            if not page and scanned_count < expected_count:
+                raise RuntimeError(
+                    f"Incremental inventory ended after {scanned_count} of "
+                    f"{expected_count} records under {canonical_uri}"
+                )
+            scanned_count += len(page)
+            for record in page:
+                record_id = str(record.get("id") or "")
+                record_uri = str(record.get("uri") or "")
+                try:
+                    level = int(record.get("level"))
+                except (TypeError, ValueError):
+                    level = -1
+                if (
+                    not record_id
+                    or level not in {0, 1, 2}
+                    or not uri_in_transfer_scope(record_uri, canonical_uri, recursive=True)
+                ):
+                    raise RuntimeError(
+                        "Incremental inventory returned an invalid record under "
+                        f"{canonical_uri}: id={record_id or '<missing>'} "
+                        f"uri={record_uri or '<missing>'} level={level}"
+                    )
+                if record_id in records:
+                    raise RuntimeError(
+                        f"Incremental inventory returned duplicate record id: {record_id}"
+                    )
+                records[record_id] = {
+                    "id": record_id,
+                    "uri": record_uri,
+                    "level": level,
+                    "md5": str(record.get("md5") or ""),
+                }
+            if scanned_count > expected_count:
+                raise RuntimeError(
+                    f"Incremental inventory returned {scanned_count} records but count was "
+                    f"{expected_count} under {canonical_uri}"
+                )
+            if next_cursor is None:
+                if scanned_count == expected_count:
+                    break
+                raise RuntimeError(
+                    f"Incremental inventory cursor ended after {scanned_count} of "
+                    f"{expected_count} records under {canonical_uri}"
+                )
+            if next_cursor in seen_cursors:
+                raise RuntimeError(
+                    f"Incremental inventory cursor repeated under {canonical_uri}: {next_cursor}"
+                )
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
+        return records
+
+    async def hydrate_incremental_records(
+        self,
+        expected: Mapping[str, Mapping[str, Any]],
+        *,
+        ctx: RequestContext,
+        batch_size: int = 100,
+    ) -> Dict[str, Dict[str, Any]]:
+        """Load required non-vector fields, using strict DSL before ID fallback."""
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        requested_ids = list(expected)
+        hydrated: Dict[str, Dict[str, Any]] = {}
+
+        def _accept(record: Mapping[str, Any]) -> None:
+            record_id = str(record.get("id") or "")
+            wanted = expected.get(record_id)
+            if wanted is None:
+                raise RuntimeError(
+                    f"Incremental hydration returned unexpected record id: {record_id or '<missing>'}"
+                )
+            record_uri = str(record.get("uri") or "")
+            try:
+                level = int(record.get("level"))
+            except (TypeError, ValueError):
+                level = -1
+            if (
+                record_uri != str(wanted.get("uri") or "")
+                or level != int(wanted.get("level", -1))
+                or (record.get("account_id") not in {None, ctx.account_id})
+            ):
+                raise RuntimeError(
+                    f"Incremental hydration identity mismatch for record: {record_id}"
+                )
+            if record_id in hydrated:
+                raise RuntimeError(
+                    f"Incremental hydration returned duplicate record id: {record_id}"
+                )
+            hydrated[record_id] = {
+                field: record[field]
+                for field in INCREMENTAL_HYDRATION_OUTPUT_FIELDS
+                if field in record
+            }
+
+        for start in range(0, len(requested_ids), batch_size):
+            chunk = requested_ids[start : start + batch_size]
+            cursor: Optional[str] = None
+            seen_cursors: set[str] = set()
+            while True:
+                page, next_cursor = await self._strict_transfer_page(
+                    ctx,
+                    In("id", chunk),
+                    limit=batch_size,
+                    cursor=cursor,
+                    output_fields=INCREMENTAL_HYDRATION_OUTPUT_FIELDS,
+                )
+                for record in page:
+                    _accept(record)
+                if next_cursor is None:
+                    break
+                if next_cursor in seen_cursors:
+                    raise RuntimeError(f"Incremental hydration cursor repeated: {next_cursor}")
+                seen_cursors.add(next_cursor)
+                cursor = next_cursor
+
+            missing = [record_id for record_id in chunk if record_id not in hydrated]
+            if missing:
+                for record in await self._strict_transfer_get(ctx, missing):
+                    _accept(record)
+        return hydrated
 
     async def delete_account_data(self, account_id: str, *, ctx: RequestContext) -> int:
         """删除指定 account 的所有数据（仅限，root 角色操作）"""

@@ -665,7 +665,9 @@ async def test_vectorize_directory_meta_l1_abstract_is_overview(monkeypatch):
     }
     await embedding_utils.vectorize_directory_meta(
         uri=uri,
-        abstract=render_abstract_overview(ContextLevel.ABSTRACT, uri, "Visible abstract.", metadata),
+        abstract=render_abstract_overview(
+            ContextLevel.ABSTRACT, uri, "Visible abstract.", metadata
+        ),
         overview=render_abstract_overview(ContextLevel.OVERVIEW, uri, overview, metadata),
         ctx=DummyReq(),
     )
@@ -1144,3 +1146,35 @@ async def test_vectorize_directory_meta_truncates_oversized_abstract(monkeypatch
         abstract = item.context_data["abstract"]
         assert len(abstract.encode("utf-8")) <= embedding_utils._ABSTRACT_MAX_BYTES
         assert abstract.encode("utf-8").decode("utf-8") == abstract
+
+
+@pytest.mark.asyncio
+async def test_full_upsert_append_merges_existing_search_tags_before_enqueue(monkeypatch):
+    queue = DummyQueue()
+    monkeypatch.setattr(embedding_utils, "get_queue_manager", lambda: DummyQueueManager(queue))
+    monkeypatch.setattr(embedding_utils, "get_viking_fs", lambda: DummyFS("body"))
+    monkeypatch.setattr(
+        embedding_utils,
+        "get_openviking_config",
+        lambda: types.SimpleNamespace(
+            embedding=types.SimpleNamespace(text_source="summary_only", max_input_tokens=1000)
+        ),
+    )
+
+    await embedding_utils.vectorize_file(
+        file_path="viking://resources/repo/a.py",
+        summary_dict={"name": "a.py", "summary": "summary"},
+        parent_uri="viking://resources/repo",
+        ctx=DummyReq(),
+        scalar_override={"search_tags": ["team=old", "lang=python"]},
+        ingest_options=IngestOptions.from_search_tags(["team=new", "owner=alice"], mode="append"),
+        partial_update=False,
+    )
+
+    msg = queue.items[0]
+    assert msg.context_data["search_tags"] == [
+        "team=new",
+        "lang=python",
+        "owner=alice",
+    ]
+    assert msg.context_data["_upsert_options"]["partial_update"] is False

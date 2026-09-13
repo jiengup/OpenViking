@@ -69,6 +69,28 @@ class AddResourceProcessor(DequeueHandlerBase):
         staged = StagedSource.from_dict(msg.staged_source)
         await self._viking_fs.delete_temp(staged.temp_uri, ctx=ctx)
 
+    async def _cleanup_prepared_artifact(self, msg: AddResourceMsg, ctx: RequestContext) -> None:
+        if not msg.prepared or not isinstance(msg.prepared.get("artifact_ref"), dict):
+            return
+        from openviking.parse.output import (
+            AgfsParseOutputStore,
+            ParseArtifactRef,
+            build_parse_output_store,
+        )
+
+        artifact_ref = ParseArtifactRef.from_dict(msg.prepared["artifact_ref"])
+        if artifact_ref.backend == "local":
+            from openviking_cli.utils.config import get_openviking_config
+
+            parse_output = get_openviking_config().storage.parse_output
+            store = build_parse_output_store(
+                backend="local",
+                local_root=parse_output.resolved_local_root(),
+            )
+        else:
+            store = AgfsParseOutputStore(viking_fs=self._viking_fs, ctx=ctx)
+        await store.cleanup(artifact_ref)
+
     async def _release_cancelled_resources(
         self,
         msg: AddResourceMsg,
@@ -88,6 +110,8 @@ class AddResourceProcessor(DequeueHandlerBase):
                 logger.warning("[AddResource] Failed to release cancelled lock handoff: %s", exc)
         with suppress(Exception):
             await self._cleanup_staged_source(msg, ctx)
+        with suppress(Exception):
+            await self._cleanup_prepared_artifact(msg, ctx)
 
     async def _record_watch_execution(
         self,
@@ -158,6 +182,8 @@ class AddResourceProcessor(DequeueHandlerBase):
             else:
                 with suppress(Exception):
                     await self._cleanup_staged_source(msg, ctx)
+                with suppress(Exception):
+                    await self._cleanup_prepared_artifact(msg, ctx)
             status = (
                 "cancelled"
                 if task.status in (TaskStatus.CANCELLING, TaskStatus.CANCELLED)
@@ -192,6 +218,8 @@ class AddResourceProcessor(DequeueHandlerBase):
                 unregister_telemetry(telemetry_id)
                 with suppress(Exception):
                     await self._cleanup_staged_source(msg, ctx)
+                with suppress(Exception):
+                    await self._cleanup_prepared_artifact(msg, ctx)
                 return None
 
         telemetry = resolve_telemetry(telemetry_id) if telemetry_id else None

@@ -15,6 +15,7 @@ from typing import Any, Dict, Optional, Set
 
 from openviking.server.identity import RequestContext
 from openviking.storage.viking_fs import get_viking_fs
+from openviking.utils.content_hash import content_md5
 from openviking_cli.utils import get_logger
 
 logger = get_logger(__name__)
@@ -92,6 +93,95 @@ def build_artifact_image_mappings(root_dir: Path) -> Dict[str, Dict[str, str]]:
             mappings[md_path.relative_to(root).as_posix()] = file_mappings
 
     return mappings
+
+
+async def rewrite_artifact_image_uris(
+    store: Any,
+    artifact_ref: Any,
+    *,
+    doc_rel: str,
+    target_root_uri: str,
+) -> Set[str]:
+    """Rewrite artifact markdown to final URIs before diffing or uploading."""
+    from openviking.parse.parsers.upload_utils import ARTIFACT_MANIFEST_NAME
+
+    base = doc_rel.strip("/")
+    rewritten: Set[str] = set()
+    md5_by_artifact_rel: Dict[str, str] = {}
+    try:
+        raw_manifest = await store.read_bytes(artifact_ref, ARTIFACT_MANIFEST_NAME)
+        loaded = json.loads(raw_manifest.decode("utf-8"))
+        if isinstance(loaded, dict):
+            md5_by_artifact_rel = {str(key): str(value) for key, value in loaded.items()}
+    except Exception:
+        pass
+
+    async def _walk(
+        rel_path: str,
+        inherited_mapping_dir: str = "",
+        inherited_mappings: Optional[Dict[str, Dict[str, str]]] = None,
+    ) -> None:
+        entries = await store.list(artifact_ref, rel_path)
+        names = {
+            entry.name for entry in entries if not entry.is_dir and not entry.name.startswith(".")
+        }
+        mapping_rel = (
+            f"{rel_path}/{IMAGE_MAPPINGS_FILENAME}" if rel_path else IMAGE_MAPPINGS_FILENAME
+        )
+        mappings = inherited_mappings or {}
+        mapping_dir = inherited_mapping_dir
+        try:
+            loaded = json.loads((await store.read_bytes(artifact_ref, mapping_rel)).decode("utf-8"))
+            if isinstance(loaded, dict):
+                mappings = loaded
+                mapping_dir = rel_path
+        except Exception:
+            pass
+
+        for entry in entries:
+            if entry.is_dir:
+                await _walk(entry.rel_path, mapping_dir, mappings)
+                continue
+            if not entry.name.lower().endswith((".md", ".markdown")):
+                continue
+            key = (
+                entry.rel_path[len(mapping_dir) + 1 :]
+                if mapping_dir and entry.rel_path.startswith(mapping_dir + "/")
+                else entry.rel_path
+            )
+            path_mappings = mappings.get(key)
+            if not isinstance(path_mappings, dict) or not path_mappings:
+                continue
+            raw = await store.read_bytes(artifact_ref, entry.rel_path)
+            content = raw.decode("utf-8")
+            relative = entry.rel_path[len(base) + 1 :] if base else entry.rel_path
+            target_uri = (
+                target_root_uri.rstrip("/")
+                if not relative
+                else f"{target_root_uri.rstrip('/')}/{relative}"
+            )
+            target_dir = target_uri.rsplit("/", 1)[0]
+            updated, count = _rewrite_content(
+                content,
+                target_dir,
+                names,
+                {str(key): str(value) for key, value in path_mappings.items()},
+            )
+            if count <= 0:
+                continue
+            encoded = updated.encode("utf-8")
+            await store.write_bytes(artifact_ref, entry.rel_path, encoded)
+            md5_by_artifact_rel[entry.rel_path] = content_md5(encoded)
+            rewritten.add(relative)
+
+    await _walk(base)
+    if rewritten:
+        await store.write_text(
+            artifact_ref,
+            ARTIFACT_MANIFEST_NAME,
+            json.dumps(md5_by_artifact_rel, ensure_ascii=False, sort_keys=True),
+        )
+    return rewritten
 
 
 def _is_remote_uri(path: str) -> bool:

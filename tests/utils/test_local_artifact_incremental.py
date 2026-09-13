@@ -10,12 +10,14 @@ touches changed files.
 """
 
 import json
+from unittest.mock import AsyncMock
 
 import pytest
 
 from openviking.parse.output import LocalParseOutputStore
 from openviking.parse.parsers.upload_utils import ARTIFACT_MANIFEST_NAME
 from openviking.utils.content_hash import content_md5
+from openviking.utils.ingest_options import IngestOptions
 from openviking.utils.resource_processor import ResourceProcessor
 
 
@@ -81,6 +83,34 @@ class _RecordingVikingDB(_DummyVikingDB):
 
     async def delete_uris(self, ctx, uris):
         self.deleted_uris.extend(uris)
+
+    async def get_incremental_inventory_under_uri(self, target_uri, *, ctx):
+        del ctx
+        prefix = target_uri.rstrip("/") + "/"
+        return {
+            f"record-{index}": {
+                "id": f"record-{index}",
+                "uri": uri,
+                "level": int(record.get("level", 2)),
+                "md5": str(record.get("md5") or ""),
+            }
+            for index, (uri, record) in enumerate(self._records.items())
+            if uri.startswith(prefix)
+        }
+
+    async def hydrate_incremental_records(self, expected, *, ctx):
+        del ctx
+        result = {}
+        for record_id, identity in expected.items():
+            record = self._records.get(identity["uri"])
+            if record is not None:
+                result[record_id] = {
+                    "id": record_id,
+                    "uri": identity["uri"],
+                    "level": identity["level"],
+                    **record,
+                }
+        return result
 
 
 class _Ctx:
@@ -217,6 +247,50 @@ async def test_incremental_deletes_chunk_only_orphan(tmp_path, monkeypatch):
 
     assert result.orphan_vectors == ["ghost.py#chunk_0001"]
     assert vikingdb.deleted_uris == [chunk_uri]
+
+
+@pytest.mark.asyncio
+async def test_plan_commit_deletes_file_but_defers_vector_delete(tmp_path, monkeypatch):
+    store, ref = await _artifact(tmp_path, {"a.py": b"print('a')"})
+    agfs = _RecordingAgfs({f"{_ROOT}/a.py": b"print('a')", f"{_ROOT}/b.py": b"print('b')"})
+    vikingdb = _RecordingVikingDB(
+        {
+            f"{_ROOT}/a.py": {
+                "md5": content_md5(b"print('a')"),
+                "abstract": "A",
+            },
+            f"{_ROOT}/b.py": {
+                "md5": content_md5(b"print('b')"),
+                "abstract": "B",
+            },
+        }
+    )
+    monkeypatch.setattr("openviking.utils.resource_processor.get_viking_fs", lambda: agfs)
+    monkeypatch.setattr(
+        "openviking.utils.resource_processor.rewrite_image_uris",
+        AsyncMock(return_value={"files_processed": 0, "references_rewritten": 0}),
+    )
+
+    result, plan = await ResourceProcessor(vikingdb=vikingdb)._commit_directory_artifact_with_plan(
+        output_store=store,
+        artifact_ref=ref,
+        doc_rel="repository",
+        root_uri=_ROOT,
+        target_preexisting=True,
+        ctx=_Ctx(),
+        lease_ref=None,
+        vectorize=True,
+        is_code_repo=True,
+        ingest_options=IngestOptions(),
+        source_metadata=None,
+    )
+
+    assert result.deleted == ["b.py"]
+    assert f"{_ROOT}/b.py" in agfs.removed
+    assert vikingdb.deleted_uris == []
+    tombstone = next(entry for entry in plan.tree.entries if entry.relative_path == "b.py")
+    assert tombstone.state == "deleted"
+    assert tombstone.indexed_records[0].record_id
 
 
 @pytest.mark.asyncio

@@ -50,6 +50,7 @@ from openviking.storage.queuefs.semantic_dag import DagStats, SemanticDagExecuto
 from openviking.storage.queuefs.semantic_lock import SemanticLockScope
 from openviking.storage.queuefs.semantic_msg import SemanticMsg, build_semantic_coalesce_key
 from openviking.storage.queuefs.semantic_ops.freshness_policy import FreshnessAction
+from openviking.storage.queuefs.semantic_plan import SemanticPlan
 from openviking.storage.queuefs.semantic_queue import is_semantic_msg_stale
 from openviking.storage.viking_fs import LS_ALL_NODES, SyncDiff, get_viking_fs
 from openviking.telemetry import bind_telemetry, bind_telemetry_stage, resolve_telemetry
@@ -346,6 +347,36 @@ class SemanticProcessor(DequeueHandlerBase):
             await semantic_queue.enqueue(parent_msg)
         logger.info("Enqueued parent semantic refresh: %s", parent_uri)
 
+    async def _enqueue_plan_vector_deletes(self, msg: SemanticMsg, plan: SemanticPlan) -> None:
+        from openviking.storage.queuefs import get_queue_manager
+        from openviking.storage.queuefs.embedding_msg import EmbeddingMsg
+        from openviking.utils.embedding_utils import _enqueue_embedding_message
+
+        record_ids = {record.record_id for record in plan.orphan_vector_deletes}
+        for entry in plan.tree.entries:
+            if entry.state == "deleted":
+                record_ids.update(record.record_id for record in entry.indexed_records)
+            elif entry.state == "added":
+                record_ids.update(record.record_id for record in entry.indexed_records)
+        if not record_ids:
+            return
+        queue_manager = get_queue_manager()
+        embedding_queue = queue_manager.get_queue(queue_manager.EMBEDDING, allow_create=True)
+        delete_msg = EmbeddingMsg.for_delete(
+            record_ids=sorted(record_ids),
+            context_data={
+                "uri": plan.root_uri,
+                "account_id": msg.account_id,
+                "owner_user_id": msg.user_id,
+            },
+            telemetry_id=msg.telemetry_id,
+        )
+        await _enqueue_embedding_message(
+            embedding_queue,
+            delete_msg,
+            failure_message=f"Failed to enqueue planned vector deletes for {plan.root_uri}",
+        )
+
     async def on_dequeue(
         self,
         data: Optional[Dict[str, Any]],
@@ -443,10 +474,45 @@ class SemanticProcessor(DequeueHandlerBase):
                         ),
                     )
                     try:
+                        if msg.plan is not None:
+                            if msg.uri.rstrip("/") != msg.plan.root_uri:
+                                raise ValueError("semantic message URI must match plan root_uri")
+                            if msg.context_type != msg.plan.context_type:
+                                raise ValueError(
+                                    "semantic message context_type must match semantic plan"
+                                )
+                            await self._enqueue_plan_vector_deletes(msg, msg.plan)
+                            for run_uri in msg.plan.execution_root_uris():
+                                executor = SemanticDagExecutor(
+                                    processor=self,
+                                    context_type=msg.context_type,
+                                    max_concurrent_llm=self.max_concurrent_llm,
+                                    ctx=current_ctx,
+                                    lock=semantic_lock.lock,
+                                    source=msg.plan.source_metadata,
+                                    semantic_plan=msg.plan,
+                                )
+                                await executor.run(run_uri)
+                                self._cache_dag_stats(
+                                    msg.telemetry_id, run_uri, executor.get_stats()
+                                )
+                                if not executor.stale and msg.plan.propagation.enabled:
+                                    write_result = getattr(
+                                        executor,
+                                        "root_write_result",
+                                        AbstractOverviewWriteResult(
+                                            wrote=True, abstract_body_changed=True
+                                        ),
+                                    )
+                                    await self._enqueue_parent_refresh(
+                                        msg,
+                                        run_uri,
+                                        l0_body_changed=write_result.abstract_body_changed,
+                                    )
                         # Regular memory writes keep their specialized update path.
                         # Callers must explicitly opt into directory aggregation; the
                         # trigger remains descriptive metadata, not an algorithm switch.
-                        if msg.context_type == "memory" and not msg.use_hierarchical_aggregation:
+                        elif msg.context_type == "memory" and not msg.use_hierarchical_aggregation:
                             await self._process_memory_directory(
                                 msg,
                                 ctx=current_ctx,
@@ -1625,6 +1691,8 @@ class SemanticProcessor(DequeueHandlerBase):
         ctx: Optional[RequestContext] = None,
         ingest_options: IngestOptions | None = None,
         creator_acl_grant: CreatorAclGrant | None = None,
+        scalar_overrides: Optional[Dict[int, Dict[str, Any]]] = None,
+        partial_update: bool = True,
     ) -> None:
         """Create directory Context and enqueue to EmbeddingQueue."""
 
@@ -1639,6 +1707,8 @@ class SemanticProcessor(DequeueHandlerBase):
             ctx=active_ctx,
             ingest_options=ingest_options,
             creator_acl_grant=creator_acl_grant,
+            scalar_overrides=scalar_overrides,
+            partial_update=partial_update,
         )
 
     async def _load_transfer_file_summaries(
@@ -1656,6 +1726,48 @@ class SemanticProcessor(DequeueHandlerBase):
         active_ctx = ctx or self._default_ctx
         return await vector_store.get_l2_abstracts_by_uris(file_paths, ctx=active_ctx)
 
+    async def _update_file_vector_fields(
+        self,
+        *,
+        record_id: str,
+        file_path: str,
+        file_md5: Optional[str],
+        file_content: Optional[bytes],
+        ctx: RequestContext,
+    ) -> None:
+        from openviking.storage.queuefs import get_queue_manager
+        from openviking.storage.queuefs.embedding_msg import EmbeddingMsg
+        from openviking.storage.viking_vector_index_backend import VIKINGDB_CONTENT_MAX_SIZE
+        from openviking.telemetry import get_current_telemetry
+        from openviking.utils.embedding_utils import (
+            _coerce_text_file_content,
+            _enqueue_embedding_message,
+        )
+        from openviking.utils.time_utils import get_current_timestamp
+
+        fields: Dict[str, Any] = {"updated_at": get_current_timestamp()}
+        if file_md5:
+            fields["md5"] = file_md5
+        if file_content is not None:
+            fields["content"] = _coerce_text_file_content(file_content)[:VIKINGDB_CONTENT_MAX_SIZE]
+        embedding_msg = EmbeddingMsg.for_update_fields(
+            record_id=record_id,
+            fields=fields,
+            context_data={
+                "uri": file_path,
+                "account_id": ctx.account_id,
+                "owner_user_id": ctx.user.user_id,
+            },
+            telemetry_id=get_current_telemetry().telemetry_id,
+        )
+        queue_manager = get_queue_manager()
+        embedding_queue = queue_manager.get_queue(queue_manager.EMBEDDING, allow_create=True)
+        await _enqueue_embedding_message(
+            embedding_queue,
+            embedding_msg,
+            failure_message=f"Failed to enqueue file scalar update for {file_path}",
+        )
+
     async def _vectorize_single_file(
         self,
         parent_uri: str,
@@ -1669,6 +1781,8 @@ class SemanticProcessor(DequeueHandlerBase):
         creator_acl_grant: CreatorAclGrant | None = None,
         file_md5: Optional[str] = None,
         file_content: Optional[bytes] = None,
+        scalar_override: Optional[Dict[str, Any]] = None,
+        partial_update: bool = True,
     ) -> None:
         """Vectorize a single file using its content or summary."""
         from openviking.utils.embedding_utils import vectorize_file
@@ -1686,4 +1800,6 @@ class SemanticProcessor(DequeueHandlerBase):
             creator_acl_grant=creator_acl_grant,
             file_md5=file_md5,
             file_content=file_content,
+            scalar_override=scalar_override,
+            partial_update=partial_update,
         )

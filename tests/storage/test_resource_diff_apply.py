@@ -34,6 +34,7 @@ class _FakeTarget:
         self.written = {}
         self.deleted_files = []
         self.deleted_vectors = []
+        self.created_dirs = []
 
     async def read_file(self, rel_path):
         return self.existing[rel_path]
@@ -48,6 +49,9 @@ class _FakeTarget:
 
     async def delete_vector(self, rel_path):
         self.deleted_vectors.append(rel_path)
+
+    async def mkdir(self, rel_path):
+        self.created_dirs.append(rel_path)
 
 
 _REF = ParseArtifactRef(backend="agfs", root="viking://temp/n", root_type="dir")
@@ -92,6 +96,56 @@ class TestApplyDiffPlan:
         assert target.deleted_vectors == ["gone.py", "ghost.py"]
         assert result.deleted == ["gone.py"]
 
+    async def test_file_tree_only_apply_defers_vector_deletes(self) -> None:
+        plan = DiffPlan(
+            deleted=["gone.py"],
+            orphan_vectors=["ghost.py"],
+            structural=["replaced"],
+        )
+        target = _FakeTarget(existing={"gone.py": b"x", "replaced": b"old"})
+
+        result = await apply_diff_plan(
+            plan,
+            store=_FakeStore({}),
+            artifact_ref=_REF,
+            target=target,
+            delete_vectors=False,
+        )
+
+        assert target.deleted_files == ["replaced", "gone.py"]
+        assert target.deleted_vectors == []
+        assert result.orphan_vectors == ["ghost.py"]
+
+    async def test_deleted_directories_are_removed_deepest_first(self) -> None:
+        plan = DiffPlan(deleted_dirs=["old", "old/nested"])
+        target = _FakeTarget()
+
+        result = await apply_diff_plan(
+            plan,
+            store=_FakeStore({}),
+            artifact_ref=_REF,
+            target=target,
+            delete_vectors=False,
+        )
+
+        assert target.deleted_files == ["old"]
+        assert result.deleted_dirs == ["old"]
+
+    async def test_added_directories_are_created_shallowest_first(self) -> None:
+        plan = DiffPlan(added_dirs=["src/nested", "src"])
+        target = _FakeTarget()
+
+        result = await apply_diff_plan(
+            plan,
+            store=_FakeStore({}),
+            artifact_ref=_REF,
+            target=target,
+            delete_vectors=False,
+        )
+
+        assert target.created_dirs == ["src", "src/nested"]
+        assert result.added_dirs == ["src", "src/nested"]
+
     async def test_needs_body_compare_equal_is_unchanged(self) -> None:
         plan = DiffPlan(needs_body_compare=["a.py"])
         store = _FakeStore({"a.py": b"same"})
@@ -113,6 +167,35 @@ class TestApplyDiffPlan:
         assert result.modified == ["a.py"]
         assert target.written == {"a.py": b"new"}
         assert result.md5_by_rel["a.py"] == content_md5(b"new")
+
+    async def test_repair_with_different_body_uploads_and_keeps_repair_state(self) -> None:
+        plan = DiffPlan(repair=["a.py"])
+        target = _FakeTarget(existing={"a.py": b"old"})
+
+        result = await apply_diff_plan(
+            plan,
+            store=_FakeStore({"a.py": b"new"}),
+            artifact_ref=_REF,
+            target=target,
+        )
+
+        assert target.written == {"a.py": b"new"}
+        assert result.repair == ["a.py"]
+        assert result.md5_by_rel["a.py"] == content_md5(b"new")
+
+    async def test_repair_with_same_body_skips_upload_but_keeps_repair_state(self) -> None:
+        plan = DiffPlan(repair=["a.py"])
+        target = _FakeTarget(existing={"a.py": b"same"})
+
+        result = await apply_diff_plan(
+            plan,
+            store=_FakeStore({"a.py": b"same"}),
+            artifact_ref=_REF,
+            target=target,
+        )
+
+        assert target.written == {}
+        assert result.repair == ["a.py"]
 
     async def test_structural_replaces_by_delete_then_write(self) -> None:
         # A path that flipped file<->dir must be removed before the new node is

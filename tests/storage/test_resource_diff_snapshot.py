@@ -15,6 +15,7 @@ import pytest
 
 from openviking.parse.output import AgfsParseOutputStore, ParseArtifactRef
 from openviking.storage.resource_diff import (
+    build_resource_diff_snapshot,
     read_new_manifest,
     read_target_file_snapshot,
     read_target_vector_snapshot,
@@ -77,6 +78,20 @@ class _FakeVikingDB:
         return {
             uri: value
             for uri, value in self._records.items()
+            if uri == target_uri or uri.startswith(prefix)
+        }
+
+    async def get_incremental_inventory_under_uri(self, target_uri, *, ctx):
+        del ctx
+        prefix = target_uri.rstrip("/") + "/"
+        return {
+            str(value.get("id") or f"id-{index}"): {
+                "id": str(value.get("id") or f"id-{index}"),
+                "uri": uri,
+                "level": int(value.get("level", 2)),
+                "md5": str(value.get("md5") or ""),
+            }
+            for index, (uri, value) in enumerate(self._records.items())
             if uri == target_uri or uri.startswith(prefix)
         }
 
@@ -193,11 +208,67 @@ class TestReadNewManifest:
         ref = ParseArtifactRef(backend="agfs", root="viking://temp/n", root_type="dir")
 
         manifest = await read_new_manifest(store, ref)
-        # Leaf files only; directories are traversed, not emitted as diff keys.
-        assert set(manifest) == {"a.py", "sub/b.py"}
+        assert set(manifest) == {"a.py", "sub", "sub/b.py"}
+        assert manifest["sub"].is_dir is True
         assert manifest["a.py"].is_dir is False
         # No artifact manifest present -> md5 unknown, diff falls back to bytes.
         assert manifest["a.py"].md5 == ""
+
+
+@pytest.mark.asyncio
+async def test_resource_diff_snapshot_reuses_all_level_inventory_for_l2_diff(tmp_path):
+    from openviking.parse.output import LocalParseOutputStore
+
+    root = "viking://resources/x"
+    store = LocalParseOutputStore(local_root=str(tmp_path / "out"))
+    ref = await store.create_artifact(root_type="dir")
+    await store.write_bytes(ref, "repository/a.py", b"a")
+    vfs = _FakeVikingFS([{"rel_path": "a.py", "isDir": False, "uri": f"{root}/a.py"}])
+    vikingdb = _FakeVikingDB(
+        {
+            root: {"id": "root-l0", "level": 0},
+            f"{root}/a.py": {"id": "a-l2", "level": 2, "md5": ""},
+        }
+    )
+
+    snapshot = await build_resource_diff_snapshot(
+        viking_fs=vfs,
+        vikingdb=vikingdb,
+        store=store,
+        artifact_ref=ref,
+        target_uri=root,
+        ctx=_Ctx(),
+        doc_rel="repository",
+    )
+
+    assert set(snapshot.vector_inventory) == {"root-l0", "a-l2"}
+    assert snapshot.plan.needs_body_compare == ["a.py"]
+
+
+@pytest.mark.asyncio
+async def test_resource_diff_snapshot_without_vector_output_compares_existing_file_body(tmp_path):
+    from openviking.parse.output import LocalParseOutputStore
+
+    root = "viking://resources/x"
+    store = LocalParseOutputStore(local_root=str(tmp_path / "out"))
+    ref = await store.create_artifact(root_type="dir")
+    await store.write_bytes(ref, "repository/a.py", b"a")
+    vfs = _FakeVikingFS([{"rel_path": "a.py", "isDir": False, "uri": f"{root}/a.py"}])
+    vikingdb = _FakeVikingDB({})
+
+    snapshot = await build_resource_diff_snapshot(
+        viking_fs=vfs,
+        vikingdb=vikingdb,
+        store=store,
+        artifact_ref=ref,
+        target_uri=root,
+        ctx=_Ctx(),
+        doc_rel="repository",
+        require_vectors=False,
+    )
+
+    assert snapshot.plan.repair == []
+    assert snapshot.plan.needs_body_compare == ["a.py"]
 
     async def test_fills_md5_from_artifact_manifest(self, tmp_path) -> None:
         from openviking.parse.output import LocalParseOutputStore

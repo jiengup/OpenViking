@@ -8,7 +8,7 @@
 
 **Tech Stack:** Python asyncio、ParserRouter/ParserRegistry、VikingFS/AGFS、TOS/S3、本地向量后端、现有 SOURCE/POST_PROCESS/semantic/embedding 队列。
 
-**状态:** P1-P5 核心链路已在独立 worktree 实施并完成 40 文件真实 S3 + 本地向量库验证；代码尚未推送。历史源码锚点仅供定位，行号随实施已发生变化。
+**状态:** P1-P5 核心链路及第 18 章的 SemanticPlan、同步前移、最小增量 DAG 已在独立 worktree 实施，并完成 shared HTTP + 真实 S3 + 本地向量库验证。远程分支已有 P1-P5 提交 `a1e56aca9`，SemanticPlan 阶段在最终验证后追加提交；历史源码锚点仅供定位，行号随实施已发生变化。
 
 ---
 
@@ -30,7 +30,7 @@
 | shared TTL | 假设足够长；过期或对象缺失直接失败，不续期、不 pin、不增加引用计数 |
 | 本地产物适用范围 | 仅在相关任务链的 workers 能访问同一机器同一路径时启用；跨机器分布式消费用 AGFS 模式 |
 | 本地产物丢失 | 直接失败，不自动重新解析恢复 |
-| 更新失败后的不一致 | 为简化实现，允许正式文件、数据库 MD5、摘要及向量不一致并长期保留；失败必须明确报错 |
+| 更新失败后的不一致 | 为简化实现，允许正式文件、数据库 MD5、摘要及向量不一致并长期保留；文件树提交和计划入队失败必须明确报错，队列内语义节点失败沿用原行为记录并跳过 |
 | 失败修复 | 不新增 index_pending，不为失败窗口增加 MD5 前置失效或自动补偿；后续增量比较不保证正确，调用方须先显式 reindex 修复 |
 | 正常交集数据 MD5 相同 | 跳过内容、语义、向量处理，忽略 tags、模型配置等非内容差异 |
 | 旧记录没有 MD5 | 回退读取新旧文件的最终正文进行比较 |
@@ -40,7 +40,7 @@
 | 其他写入入口 | 正常成功路径同样维护 MD5 或显式使其失效；更新失败时允许残留旧值，适用同样的人工修复边界 |
 | 必需解析产物失败 | 整次镜像更新终止，不进入同步、不误删目标；不做“其余文件先更新”的部分成功。合法过滤/跳过不算失败 |
 | abstract 缺失兜底 | 不保留从目录 Markdown 反解析文件摘要的兜底；向量 abstract 有则复用，无则仅在变化目录汇总确需时重新生成 |
-| 目录摘要刷新失败 | 保留现有 freshness 延迟刷新策略，但不为“刷新失败”新增恢复状态机；失败同样明确报错，由显式 reindex 修复 |
+| 目录摘要刷新失败 | 保留现有 freshness 延迟刷新策略和容错语义；记录失败并跳过当前节点，不升级为整次 `add_resources` 失败，由显式 reindex 修复 |
 
 ### 1.3 不做的事情
 
@@ -265,9 +265,9 @@ shared 引用保存服务端验证过的上传 ID、来源身份、原文件名/
 
 - `N`：新产物中的业务文件，相对路径、类型、大小、MD5、产物引用。
 - `F`：正式目标中的业务文件及目录结构。优先单次逻辑 tree 调用，必须不限总节点/深度并处理完整结果。
-- `V`：目标范围内文件的有效索引记录，及生成目录所需的目录元数据；使用完整分页过滤查询，不是相似度 top-k 检索。
+- `V`：目标目录范围内全部 L0/L1/L2 索引记录；使用完整分页过滤查询，不是相似度 top-k 检索。第一次 inventory 只取 `id/uri/level/md5`，diff 和裁剪后再按必要 ID 查询摘要及其他非向量标量。
 
-向量投影包含至少 `id/uri/level/abstract/md5`；不新增索引待修复状态，不拉取无关向量值。文件正常交集优先以实际文件 URI 的 L2 记录为准，目录 L0/L1、chunk、sidecar 不能被当作独立源文件。
+第一次向量投影为 `id/uri/level/md5`，必须覆盖 L0/L1/L2：L2 用于文件 diff，L0 ID 用于后续获取未变化子目录摘要，L0/L1 ID 用于受影响目录的更新与删除。第二次 hydration 才投影 `abstract` 等必要非向量字段；两次都不拉取 dense/sparse vector。文件正常交集只以实际文件 URI 的 L2 记录为准，目录 L0/L1、chunk、sidecar 不能被当作独立源文件。
 
 URI 规范化、租户和权限范围必须一致。已有索引转移的完整分页工具可复用，但不能照搬其扩大父目录以搜 chunk 的范围而误删相邻资源。对无权完整查看/修改的目标子树，不能用“查询不可见”推断“索引不存在”。
 
@@ -325,11 +325,11 @@ URI 规范化、租户和权限范围必须一致。已有索引转移的完整�
 
 ```text
 情况一：文件 B，MD5=B，摘要/向量仍是 A
-文件及 MD5 更新成功，但后续索引失败，本次任务报错
+文件及 MD5 更新成功，但后续索引失败；队列记录失败，调用方不应把接入成功视为索引完整
 再次导入 B 因 MD5 相同而跳过，旧摘要/向量可能长期保留
 
 情况二：文件 B，MD5=A，摘要/向量仍是 A
-文件已从 A 写成 B，但 MD5/向量更新失败，本次任务报错
+文件已从 A 写成 B，但 MD5/向量更新失败；队列记录失败，允许不一致保留
 再次导入 A 因数据库 MD5=A 而跳过，文件仍为 B，恢复 A 没有发生
 ```
 
@@ -337,7 +337,7 @@ URI 规范化、租户和权限范围必须一致。已有索引转移的完整�
 
 调用方或运维必须根据失败结果，在继续依赖增量比较前显式执行 reindex：以当前正式文件为准重新计算并覆盖 MD5，重新生成摘要和向量，并覆盖受影响目录的语义修复范围。修复不能被 MD5 相同的快速路径跳过；应验证 `semantic_and_vectors` 模式及递归范围，不能假设 `vectors_only` 一定修复旧摘要。该能力及修复用例是实施验收要求，不表示当前 reindex 已具备新增 MD5 的维护能力。reindex 不恢复原始输入；若正式文件不是用户期望的版本，修复当前指纹和索引后仍需重新导入期望内容。
 
-文件写入、MD5 更新、摘要生成、embedding 或 upsert 失败仍必须通过最终任务状态或 `wait=true` 明确报错，不得吞掉异常。正常路径只在文件写入成功后提交对应 MD5；允许中途失败保留旧 MD5，不要求事前清空旧值或事后自动回滚。
+解析完整性检查、正式文件树提交和 `SemanticPlan` 消息入队失败必须通过最终任务状态或 `wait=true` 明确报错；这些失败意味着安全的增量任务尚未建立。消息成功入队后的文件摘要、目录摘要、embedding 或 upsert 则沿用现有节点级容错：记录失败并跳过该节点，不反向回滚正式文件，也不保证整次 `add_resources` 因该节点失败而失败。正常路径只在文件写入成功后提交对应 MD5；允许中途失败保留旧 MD5，不要求事前清空旧值或事后自动回滚。
 
 无索引文件不为存 MD5 专门创建空向量记录，仍通过 F−V 识别并按原差集规则处理。若某 processing_mode 明确不要求建索引，按该模式执行，不偷偷开启向量化；后续要求建索引时再按缺索引修复。该取舍不取消现有目录 freshness 策略，也不放宽新树完整性和镜像删除门禁。
 
@@ -391,9 +391,11 @@ diff 为空且没有孤儿修复或现有目录刷新策略要求的工作时直
 
 非空变化集合只调度变化文件、受影响目录及其必要祖先。未变子目录可复用目录摘要；变化目录由“变化文件的新摘要 + 未变文件的已存 abstract + 子目录摘要”重新汇总。目录采样及大小策略保持原配置，不能借性能优化偷偷改摘要覆盖范围。
 
+上述为目标行为，不代表当前实现已经完成目录级剪枝。当前 `SemanticDagExecutor` 在 `recursive=True` 时仍会枚举并调度所有子目录及其直接文件；`changes` 主要用于在文件节点内部跳过正文、LLM 和 embedding。因此当前增量虽然能将模型调用收敛到变化文件，目录 `ls`、DAG 节点创建、未变摘要读取和状态维护仍与整棵资源树规模相关。第 18 章的带状态裁剪 tree snapshot 必须补齐真正的受影响路径最小 DAG。
+
 `changes=None` 表示未知，`changes={added:[], modified:[], deleted:[]}` 表示明确无变化；修正因 bool(empty) 而退回自比较的路径。
 
-保留现有目录 freshness 延迟刷新策略：达到阈值前记 pending、达到后触发刷新的既有逻辑照常运行，在文件落库前后按现有协议登记。但本期不为“刷新执行失败”新增恢复状态机；目录摘要刷新失败与文件索引失败同样明确报错，由第 8.2 节的显式 reindex 修复。不能因为文件向量已更新，就漏掉当次应触发的父目录摘要刷新。
+保留现有目录 freshness 延迟刷新策略：达到阈值前记 pending、达到后触发刷新的既有逻辑照常运行，在文件落库前后按现有协议登记。但本期不为“刷新执行失败”新增恢复状态机；目录摘要刷新失败记录后跳过该目录节点，由第 8.2 节的显式 reindex 修复。不能因为文件向量已更新，就漏掉当次应触发的父目录摘要刷新。
 
 主要锚点：`storage/queuefs/semantic_dag.py:608`、`:631`、`:650`、`:762`；`semantic_processor.py:448`、`:499`、`:1177`。`utils/resource_processor.py:669` 的 vectors_only 全树向量化也要改为消费变化/修复集合。
 
@@ -429,10 +431,12 @@ diff 为空且没有孤儿修复或现有目录刷新策略要求的工作时直
 | 解析/必要产物写入失败 | 不进入同步，不误删目标 |
 | tree/向量分页失败或不完整 | 不生成删除计划，不把错误当空集合 |
 | 正式文件写入/删除失败 | 报失败并记录失败路径及已发生变化；不新增文件待修复状态或自动补偿 |
-| MD5/摘要/embedding/upsert 更新失败 | 本次失败明确上报，允许与正式文件不一致；不新增 pending，由调用方显式 reindex 修复后再依赖增量比较 |
+| 文件或目录语义请求失败 | 记录失败并跳过当前 DAG 节点，其他可执行节点继续；允许摘要、sidecar 和目录传播不完整，不新增 pending，由调用方显式 reindex 修复 |
+| embedding/upsert/delete/update-fields 失败 | 沿用队列节点容错并允许与正式文件不一致；不新增 pending 或回滚，由调用方显式 reindex 修复后再依赖增量比较 |
+| `SemanticPlan` 消息入队失败 | 清理解析 artifact、释放目标锁并使 add_resources 任务失败；不能把“正式树已提交但无后续任务”报告为成功 |
 | 清理失败 | 保留可定位日志和清理债务，不伪造正文回滚 |
 
-HTTP 异步接入成功只表示任务被接受；`wait=true` 或最终任务状态必须反映后代失败。错误消息包含阶段和路径，不能记录文件全文、API key 或签名下载 URL。
+HTTP 异步接入成功只表示任务被接受。`wait=true` 或最终任务状态必须反映解析、正式树提交和计划入队失败；消息入队后的语义/向量节点按上述容错边界可能只记录节点错误并继续。错误消息包含阶段和路径，不能记录文件全文、API key 或签名下载 URL。
 
 ### 11.3 观测指标
 
@@ -492,7 +496,7 @@ P2 先引入 AGFS adapter 再引入 local adapter，便于隔离“业务行为�
 - 本地产物交接后才删除；提前丢失直接失败；shared 过期直接失败。
 - 大量文件使 tree/向量查询跨页；同名前缀相邻资源和不同租户不能被误删。
 
-健康起点或已完成显式修复的资源，正常成功后文件清单和 bytes 等于预期，索引 URI 集合符合当前 processing_mode，MD5 对应实际文件；本次实际发生的失败不能被报告为完整成功，旧异步任务不能覆盖新结果。历史失败未经修复的资源不适用增量正确性保证，后续 success 不能证明历史不一致已消除。
+健康起点或已完成显式修复的资源，在所有异步节点成功时文件清单和 bytes 等于预期，索引 URI 集合符合当前 processing_mode，MD5 对应实际文件。解析、正式树提交或计划入队失败不能被报告为成功；语义/向量节点失败允许被跳过，因此任务接入成功不等于索引完整。历史失败未经修复的资源不适用增量正确性保证，后续 success 不能证明历史不一致已消除。
 
 故障测试覆盖两种已接受状态：文件 B/MD5 B/旧向量 A，以及文件 B/旧 MD5 A/旧向量 A。验证原失败明确上报、重复导入可能跳过而不自动修复；显式 reindex 必须从实际文件重算 MD5、重建摘要和向量，完成后再次导入才恢复正确比较。后一种状态应复现“导入 A 被误跳过、文件仍为 B”的风险，不将这种失败遗留样本计作健康性能基线。
 
@@ -936,7 +940,7 @@ FailedItem: { rel_path, op, error }
 
 **缓存新鲜度：** 拿到目标锁后再取快照；若 ragfs 缓存（`cache/wrapper.rs:121`、`:1249`）可能返回锁前陈旧视图，需按缓存模式确认或绕过缓存重取。不能假设“持锁即最新”。
 
-**向量快照 V：** 用完整分页过滤查询（非 top-k 相似检索），投影 `id/uri/level/abstract/md5`。分页失败或不完整 → 快照失败，不当空集合。复用已有分页工具但收窄到本资源范围，不扩大父目录搜 chunk，避免误删相邻资源。
+**向量快照 V：** 第一次用完整分页过滤查询（非 top-k 相似检索）获取目标范围内全部 L0/L1/L2，只投影 `id/uri/level/md5`；分页失败或不完整 → 快照失败，不当空集合。diff 和语义闭包裁剪完成后，第二次按必要 record IDs 获取 `abstract` 等非向量标量。复用已有分页工具但收窄到本资源范围，不扩大父目录搜 chunk，避免误删相邻资源。
 
 **控制文件分类：** `.overview.md`、`.abstract.md`、锁、控制元数据、sidecar 单独分类，不进入业务文件差集；路径类型冲突（文件↔目录）单独处理。
 
@@ -1016,3 +1020,425 @@ diff 与快照优化必须覆盖所有落库路径，不能只优化 semantic �
 ### 17.4 实现顺序内的设计校验
 
 每个 P 阶段合入前自查：是否引入了与已有函数重复的过滤/比较/hash 逻辑；后端实现里是否混入业务规则；是否有临时/正式路径类型被字符串拼接混用。发现即上移或合并，不留“先复制后统一”的债务。
+
+## 18. 语义规划前移与最小增量 DAG
+
+本章记录 P1-P5 之后已经实施的设计，**本轮范围只覆盖目录型 `add_resources` 的 `semantic_and_vectors` 路径**。该路径在入 SemanticQueue 前完成 local/AGFS 文件树提交和业务规划，向队列传递明确、后端无关的语义计划，并让增量计划只构造受影响路径的最小 DAG。单文件 add_resources、`vectors_only`、不建索引路径，以及 resource/skill `write`、`batch-write`、`reindex`、memory 和通用手工 `summarize` 本轮保持现有接口和行为；新接口为它们保留未来接入空间，但不把迁移这些入口列为本轮交付条件。
+
+### 18.1 当前问题与设计边界
+
+`SemanticQueue` 本身主要负责消息存取和 coalesce，真正影响 `add_resources` 解耦的逻辑集中在 `SemanticProcessor.on_dequeue`：AGFS 临时树同步、根据 `uri/target_uri/changes` 推断增量模式、恢复 parse artifact，以及拼装 DAG 参数。队列反序列化、stale、熔断重试、身份和锁恢复、ACK、request tracking、父目录 freshness 等执行时职责本轮保留。
+
+| 入口 | 当前文件状态 | 当前语义调用方式 | 主要问题 |
+|---|---|---|---|
+| `add_resources` local 产物 | 入队前已完成 diff 和正式树更新 | 携带 `changes/file_md5s/file_abstracts/artifact_ref` 入队 | 参数分散，仍可能递归遍历无变化子树 |
+| `add_resources` AGFS 产物 | 入队时可能仍是临时树 | consumer 内 `_sync_topdown_recursive` 后再跑 DAG | 文件写入业务和语义队列耦合 |
+| 其他入口 | 各自保持现状 | 继续构造旧 `SemanticMsg` 或直接调用现有服务 | 明确不在本轮迁移 |
+
+目标职责边界：
+
+```text
+add_resources / ResourceProcessor
+  - 完成文件写入、diff、删除、图片 URI 规范化和正式树提交
+  - 准备变化条目、最终 MD5、旧 L2 abstract
+  - 构造 SemanticPlan
+
+现有 Summarizer / SemanticQueue enqueue
+  - 将 SemanticPlan 放入现有 SemanticMsg
+  - 处理 request tracking 和锁 handoff
+
+SemanticQueue / worker adapter
+  - 序列化、持久化、stale、熔断、重试、ACK、telemetry 和锁生命周期
+  - 新 add_resources 消息不再触发临时树同步或增量模式推断
+  - 旧消息继续走现有兼容分支
+
+SemanticDagExecutor
+  - 将 add_resources plan 中带状态的 tree snapshot 编译为 DAG 并执行
+  - 生成/复用文件摘要，聚合目录 L0/L1，按 outputs 投递 embedding
+```
+
+本轮不为抽象层次而新建空壳服务。优先在现有 `SemanticProcessor` 与 `SemanticDagExecutor` 边界引入一个清晰 plan；只有当后续第二个入口实际接入时，再根据重复代码决定是否抽出独立 `SemanticExecutionService`。队列 worker 仍负责真正执行时才能决定的事情：消息是否 stale、熔断和重试、锁的接管与最终释放、ACK，以及执行结果驱动的父目录 freshness。
+
+### 18.2 add_resources 语义参数模型
+
+不使用 `MEMORY_SCHEMA` 与 `HIERARCHICAL` 作为同一个 `strategy` 枚举。前者描述业务和生成方式，后者描述遍历结构，维度不一致。本轮 plan 只表达 add_resources 所需的“已提交正式树、处理哪些对象、产生哪些结果、如何取文件向量文本、是否向父级传播”。每个 tree entry 自带状态，不再用额外 selection 重复记录相同路径。
+
+```python
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Literal
+
+
+@dataclass(frozen=True)
+class IndexedRecordSnapshot:
+    record_id: str
+    level: int
+    abstract: str | None = None
+    md5: str | None = None
+    created_at: str | None = None
+    updated_at: str | None = None
+    active_count: int | None = None
+    name: str | None = None
+    description: str | None = None
+    tags: str | None = None
+    search_tags: tuple[str, ...] | None = None
+
+
+@dataclass(frozen=True)
+class SemanticTreeEntry:
+    relative_path: str
+    kind: Literal["file", "directory"]
+    state: Literal["unchanged", "added", "modified", "deleted"]
+    md5: str | None = None
+    indexed_records: tuple[IndexedRecordSnapshot, ...] = ()
+
+
+@dataclass(frozen=True)
+class SemanticTreeSnapshot:
+    entries: tuple[SemanticTreeEntry, ...]
+
+
+@dataclass(frozen=True)
+class VectorRecordRef:
+    record_id: str
+    uri: str
+    level: int
+
+
+@dataclass(frozen=True)
+class SemanticOutputs:
+    vectorize: bool = True
+
+
+class FileVectorSource(str, Enum):
+    CONTENT = "content"
+    SUMMARY_WHEN_AVAILABLE = "summary_when_available"
+
+
+@dataclass(frozen=True)
+class ParentPropagation:
+    enabled: bool = True
+    use_freshness: bool = True
+
+
+@dataclass(frozen=True)
+class SemanticPlan:
+    root_uri: str
+    context_type: str
+    tree: SemanticTreeSnapshot
+    orphan_vector_deletes: tuple[VectorRecordRef, ...]
+    outputs: SemanticOutputs
+    propagation: ParentPropagation
+    file_vector_source: FileVectorSource = FileVectorSource.CONTENT
+    ingest_options: IngestOptions = field(default_factory=IngestOptions)
+    source_metadata: dict[str, str] | None = None
+```
+
+语义约束：
+
+- 完整 `ResourceTreeManifest` 只在 ResourceProcessor 内部用于 diff、正式树提交和语义裁剪，不直接进入队列。`SemanticPlan.tree` 是带状态的裁剪语义快照：首次导入的当前节点均为 `added`；增量只包含变化节点、可能执行聚合的目录，以及这些目录的全部直接子项。路径均相对 `root_uri`，不包含 `.abstract.md`、`.overview.md` 及控制文件。
+- tree snapshot 不重复保存 `direct_children`。Semantic worker 按 `relative_path + kind` 一次性构造 `parent -> direct files/direct directories` 邻接表；本轮裁剪必须保证每个候选聚合目录的全部当前直接子项均作为 entry 保留。裁剪阶段不做 sampling，也不复制 freshness/overview 的采样策略；Semantic DAG 在目录真正被激活时继续调用现有唯一的 `deterministic_sample()`。
+- `indexed_records` 是构造 diff 时已查询到的轻量旧索引快照。文件条目通常携带 L2，目录条目按目录聚合需要携带 L0；除 `record_id/level/abstract/md5` 外，只携带 full upsert 必须保留的非向量业务标量，如 `created_at/active_count/name/description/tags/search_tags`，不携带 dense `vector` 或 `sparse_vector`。`uri/context_type/account_id/owner_user_id` 等身份字段由 `root_uri`、entry、当前请求上下文重新推导并校验；ACL 延续现有 materialization 逻辑，不信任 plan 中可伪造的权限字段。
+- entry 的 `state` 是 Semantic 的唯一节点状态来源，不再维护一份重复的 `ChangeSelection`。`added/modified` 文件需要生成摘要并维护 L2；`added/deleted` 节点表示目录成员或类型变化；`unchanged` 节点只作为候选目录的直接聚合输入。执行器根据这些状态构造 DAG，不得再扫描整棵子树寻找变化。
+- deleted entry 保留第一阶段 inventory 中属于该节点的旧 `indexed_records`，Semantic 据 `state=deleted` 直接生成精确 DELETE；不在 plan 顶层重复记录。DiffPlan 的 `repair` 归一化为 `state=modified` 且没有旧 L2；Semantic 据此完整重建 L2，并因旧摘要缺失保守决定目录聚合。`structural` 归一化为当前新类型的 `state=added`，同路径旧类型记录保留在该 entry 的 `indexed_records`，Semantic 删除与新 kind 不匹配的旧 level。只有纯 `orphan_vectors` 没有对应树节点，因此单独进入 `orphan_vector_deletes`。`needs_body_compare` 必须在 plan 生成前归并为 `unchanged/modified`。
+- add_resources 只在需要生成语义 sidecar 时创建 plan；`outputs.vectorize=False` 表示生成文件/目录语义但不投递 L0/L1/L2 embedding，对应 `summarize=True, build_index=False`。`vectors_only` 不创建 plan。
+- 语义 repair 与 `outputs.vectorize` 解耦：`summarize=True, build_index=False` 时，缺 L2 摘要的文件及缺 L0/L1 的目录仍标记为 `modified` 并按需进入 DAG，只禁止向 EmbeddingQueue 投递。若目标范围完全没有语义索引，则保守重建当前完整目录语义，不能把无索引误判为健康 no-op。
+- 已存在记录但聚合必需的 L2/L0 `abstract` 为空时，也不能当作可复用依赖；plan builder 将该文件或子目录定向提升为 `modified`。目录 repair 会补入其全部直接子项用于原采样和聚合逻辑，不递归扫描无关子树。
+- entry 相对路径必须规范化且不得越过 root，同一路径只能出现一次。`added/modified` 必须存在于当前正式树；`deleted` 是唯一允许不存在于当前树的 tombstone，保留旧 kind 和待删 `indexed_records`，但不得读取正文。构造当前树邻接表时排除 deleted tombstone；它只作为父目录结构变化和索引删除信号。
+- DAG 拓扑编译规则是纯内存操作：根目录用空相对路径 `""` 表示；entry 的父路径由规范化相对路径计算，不允许用“最近存在祖先”代替真实直接父目录。首次导入的裁剪树包含完整节点，可还原原全量 DAG；增量裁剪树只还原受影响路径的最小 DAG，这是预期差异。
+- entry 的 `md5` 必须对应正式树最终 bytes；`indexed_records[].md5/abstract` 是 plan 生成时读到的旧索引状态。修改文件通过“本次生成摘要与旧 L2 abstract”比较决定是否停止目录传播，旧摘要不能掩盖文件内容变化。DAG 运行中的新摘要保存在运行时结果缓存，不回写 frozen plan。
+
+不再维护独立的 `file_md5s` 或 `previous_abstracts` 映射；同一路径的拓扑、最终 MD5 和旧索引快照放在一个 entry 中，避免多张表按 URI 对齐。当前 `get_l2_diff_records_under_uri()` 只返回 L2，不能满足新计划；需新增或扩展为目标前缀下全层级 inventory。完整 inventory 查询结束后再裁剪，不能为了少查数据而破坏孤儿检测、目录记录定位和 diff 完整性。
+
+向量库读取拆成两个阶段，避免第一次目录级全量扫描返回大量最终不会使用的摘要和业务标量：
+
+1. **Diff inventory 查询：** 在目标目录锁内按目录前缀完整分页查询 L0/L1/L2 全部记录，只投影 `id/uri/level/md5`。`uri` 是 N/F/V 按路径对齐和校验查询范围的必要字段；`level` 用于区分同 URI 的 L0/L1/L2，不能只返回 `id/md5`。该结果用于文件 MD5 比较、各层索引存在性、孤儿记录和删除记录识别，并为第二次 hydration 提供精确 ID；此时不提供目录聚合正文。
+2. **Plan hydration 查询：** diff 完成并计算语义依赖闭包后，收集裁剪快照实际需要的 record IDs。优先分批使用严格 DSL `In("id", batch_ids)` 查询并显式投影非向量字段；只对 DSL 正常返回后仍缺失的 IDs 调用严格主键 `fetch/get` 回填。最终统一投影并填入 `SemanticTreeEntry.indexed_records`，不查询不在闭包中的记录，且不把 `vector/sparse_vector` 写入 plan。
+
+第二阶段 ID 集合直接从第一次 inventory 中选择，包括：modified 文件旧 L2、候选目录全部 unchanged 直接文件的 L2、全部 unchanged 直接子目录的 L0，以及可能重建目录自身的旧 L0/L1。父目录聚合依赖子目录 L0 abstract，不依赖其 L1；L1 仍需 hydration，因为受影响目录重新生成 overview 时要保留必要标量并覆盖 L1。added 文件和 repair 缺失记录没有旧 ID；仅用于删除的记录已有第一阶段 `id/uri/level`，无需查询其他字段。若预期的目录 L0/L1 未出现在第一次 inventory，则直接按“旧目录索引不存在”处理，不凭稳定 ID 猜测记录存在。
+
+第二阶段不是无约束的“整条记录 fetch”。DSL 使用显式非向量投影：`id/uri/level/abstract/md5/created_at/active_count/name/description/tags/search_tags` 等当前完整 upsert 必须保留的字段；旧 `content` 对 modified 文件已经过期，目录内容也由新 sidecar 生成，原则上不读取。身份与 ACL 字段继续由当前 URI/ctx 推导和 materialize，不直接信任队列快照。
+
+DSL 按 ID 分批时，每批不得超过后端数据面限制（当前 VikingDB 类后端按 100 控制），查询 limit 至少覆盖该批 ID 数；使用会传播异常的 strict query，不能调用把异常转换为空列表的普通 `query/filter`。DSL 请求本身失败属于查询失败，默认终止 plan 构造，不能伪装成“全部 ID 未命中”；只有 DSL 成功后，`requested_ids - returned_ids` 才进入主键 fetch fallback。若某后端明确不支持 ID DSL，应通过 adapter capability 直接选择 fetch，而不是先制造一次必然失败的请求。
+
+主键 fallback 可能返回完整记录并包含 dense/sparse vector，但只允许对缺失 ID 执行；结果进入 plan 前必须立即按白名单投影并丢弃 `vector/sparse_vector/content` 等不需要字段。两条路径合并后必须校验：返回 ID 属于请求集合、无重复、URI/level 与第一次 inventory 一致、记录属于当前 tenant。DSL 和 fetch 均未找到的记录再按用途分类：待删除记录视为幂等完成；modified 文件 L2 降级为 repair；目录聚合所需 unchanged 子项摘要缺失则定向补摘要或明确失败，不能用空摘要静默继续。
+
+两阶段查询都发生在目标资源锁持有期间，并在 SemanticPlan 成功持久化/锁 handoff 前完成。它们减少的是重复读取和队列载荷，不提供 generation fencing；历史异步索引任务仍可能在两次查询之间改写记录，继续适用第 16.3 节的已知风险。
+
+`SemanticPlan` 不包含临时树、解析后端和调用来源判断所需字段。以下内容不得进入新计划：
+
+```text
+temp_uri / source temp tree
+target_uri（计划中只有已提交的 root_uri）
+artifact_ref / artifact_files
+target_preexisting
+通过 generation_trigger 选择执行算法
+```
+
+为控制本轮改动面，不新增一套与 `SemanticMsg` 并行的队列 envelope。先给现有消息增加可选的版本化 plan：
+
+```python
+@dataclass(frozen=True)
+class SemanticMsg:
+    # Existing queue fields remain unchanged.
+    plan_version: int | None = None
+    plan: SemanticPlan | None = None
+```
+
+只有 add_resources 新生产者设置 `plan_version=1` 和 `plan`。没有 plan 的旧消息继续走现有路径，确保 write、batch-write、reindex、父目录刷新、copy/delete 和历史队列消息不受影响。旧 consumer 不理解 manifest/minimal-DAG 语义，因此本轮不承诺新 add_resources producer 与旧 consumer 混跑；部署时先升级 consumer，再启用新 producer，并在移除旧字段前排空历史消息。兼容期可按需镜像旧字段用于回滚和诊断，但不能把旧 consumer 的退化执行当作正确性或性能保证。后续其他入口迁移完成后，再决定是否引入独立 `SemanticJob`。
+
+### 18.3 带状态 tree snapshot 必须生成受影响路径最小 DAG
+
+带状态 tree snapshot 的关键验收条件不是“最终少调用模型”，而是“无变化子树不进入 DAG”。当前实现的 `recursive=True + changes` 仍会递归调度所有子目录，这是本阶段必须修掉的性能边界。
+
+示例：
+
+```text
+repo/
+├── src/
+│   ├── a.py          # modified
+│   ├── b.py          # unchanged
+│   └── utils/        # unchanged subtree
+├── docs/             # unchanged subtree
+└── tests/            # unchanged subtree
+```
+
+目标 DAG：
+
+```text
+FileSummary(src/a.py)
+        ├── FileVector(src/a.py)
+        └── if file abstract changed
+                ↓
+          DirectoryAggregate(src)
+                └── SemanticExecutionResult.abstract_changed
+                        ↓
+                 ParentFreshness(repo)
+```
+
+不得创建或进入：
+
+```text
+docs 的 dir/file DAG 节点
+tests 的 dir/file DAG 节点
+utils 内部的任何节点
+b.py 的正文读取、LLM 或 embedding 节点
+```
+
+重新聚合 `src` 时仍需获得其直接子项语义，但只能读取直接层信息：
+
+```text
+a.py   → 使用本次 FileSummary 的新摘要
+b.py   → 使用 plan entry 中的旧 L2 abstract
+utils  → 使用 plan entry 中的旧 L0 abstract
+```
+
+当前目录的全部直接子项和所需旧摘要由 tree snapshot 的邻接表与各 child entry 的 `indexed_records` 提供；正常聚合不再执行 `ls(src)`，也不再查询向量库，更不允许递归进入 `utils`。目录真正执行时，DAG 在邻接表中的全部直接子项上调用现有 `deterministic_sample()`，只把采样结果交给 overview 模型；这不会要求 plan 包含未变化子目录的后代。若某个未变化直接子项缺少所需摘要，只为该直接子项动态补任务：文件补一个 FileSummary，目录可显式执行该目录修复或使当前任务失败并要求 reindex；不能无条件退化为扫描整个 root。只有 `UPDATE_FIELDS` 为保留未携带的 dense/sparse vector 时允许按稳定 ID 二次查询完整旧记录。
+
+最小 DAG 编译规则：
+
+1. `state=added/modified` 的文件创建文件摘要节点；`state=deleted` 的文件不读取正文。
+2. 从每个非 unchanged entry 推导其直接父目录，构造去重后的受影响目录集合。
+3. added/deleted 目录及文件/目录类型替换后的 added entry 标记直接父目录结构变化；已删除目录内部不再建节点。
+4. 变化文件摘要与旧摘要相同时，文件 L2/MD5 仍更新，但不执行直接父目录聚合。
+5. 文件摘要变化或目录成员发生增删时，才执行直接父目录聚合。
+6. 目录聚合只使用从 plan entry 路径构建的全部直接子项及其旧摘要，在执行时复用现有唯一采样函数；不再查询正常聚合输入，也不递归进入未变化子目录。
+7. 当前目录 L0 未变化则停止向上；变化后沿用现有 `_enqueue_parent_refresh` 运行 freshness 策略。
+8. 父目录达到 freshness 阈值时，本轮仍由现有 helper 产生 `recursive=False` 的旧格式父目录消息；它只聚合父目录，不回扫完成的子树。
+
+若裁剪后所有 entry 均为 `unchanged` 且没有 `orphan_vector_deletes`，表示调用方确认无变化；在不存在 freshness 欠账或修复工作的前提下，业务层不得入 SemanticQueue。首次导入则把完整当前树 entry 标记为 `added`，不需要额外的全量 selection。
+
+### 18.4 文件树同步统一前移
+
+local 模式当前已在 `ResourceProcessor` 中完成 diff 和正式树更新；AGFS 模式仍把 temp→target sync 放在 Semantic consumer。下一阶段将二者统一为：
+
+```text
+ParseArtifactRef (local/agfs)
+        ↓
+ResourceTreeCommitService
+  - 完整性门禁
+  - 规范化最终 bytes / 图片 URI
+  - 构造完整新树 manifest
+  - 读取目标 F/V 快照
+  - 构造并应用 DiffPlan
+  - 更新正式文件树、删除旧文件、处理文件/目录类型冲突
+  - 不直接删除或更新向量；将确定的向量操作写入 SemanticPlan
+  - 产出完整 ResourceTreeManifest + AppliedResourceChangeSet
+        ↓
+add_resources SemanticPlan builder
+  - 裁剪语义树快照
+  - 将文件变化及其旧记录写入 entry，将纯孤儿删除写入 plan.orphan_vector_deletes
+        ↓
+现有 Summarizer / SemanticQueue enqueue
+```
+
+完整 `ResourceTreeManifest` 来自已通过完整性门禁、规范化并成功提交的解析产物，不依赖正式 S3/AGFS 的写后递归列举；`AppliedResourceChangeSet` 只能包含实际成功提交的文件变化，并携带新增/修改文件最终 MD5。优先复用现有 `DiffPlan`、`ApplyResult`、parse output store 与 resource target，不为本轮再复制一套 diff 实现；仅在确有复用价值时抽取薄的正式树提交协调函数。
+
+本阶段覆盖现有 `apply_diff_plan()` 的向量副作用：ResourceTreeCommitService 只执行正式文件系统操作。DiffPlan 中 deleted 节点和 structural 旧层级的记录保存在对应 entry 的 `indexed_records`；repair、added、modified 归一化为 entry 状态，其中 repair 使用 `modified + 旧 L2 缺失` 表达。纯 orphan 没有树节点，转换成精确 `VectorRecordRef` 放入 `SemanticPlan.orphan_vector_deletes`。这些向量删除、更新和新增均在下游通过 EmbeddingQueue 执行。Semantic worker 对新 add_resources plan 只点读正式 `root_uri` 下计划要求的文件 bytes，不再调用 `_sync_topdown_recursive`，也不负责图片映射搬运、temp tree 删除、local artifact store 恢复或通过远程 `tree/ls` 发现整棵拓扑。旧消息路径暂时保留原行为。
+
+同步前移后存在已接受的失败窗口：正式树提交成功、SemanticMsg 入队前进程崩溃，会留下文件与语义/向量不一致。按第 8.2 节既定取舍，不新增 `index_pending` 或自动补偿；原操作明确失败，调用方通过 `reindex semantic_and_vectors` 修复。锁仍需从正式树提交阶段 handoff 给队列 worker，不能在任务入队后立即释放，否则语义任务可能读取到下一代文件内容。local/AGFS artifact 在正式树提交并成功入队后由 ResourceProcessor 清理；入队失败则由同一上层失败路径清理。
+
+### 18.5 本轮 add_resources 映射与其他入口边界
+
+| 入口/模式 | tree 状态 | outputs | 执行方式 |
+|---|---|---|---|
+| `add_resources` 首次目录、`semantic_and_vectors` | 完整裁剪树的当前 entry 均为 `added` | 文件摘要、目录语义；`build_index` 决定是否生成向量 | queued |
+| `add_resources` 增量目录、`semantic_and_vectors` | 变化 entry 带 `added/modified/deleted`，聚合依赖为 `unchanged` | 文件摘要、目录语义；`build_index` 决定是否生成向量 | queued |
+| `add_resources` 单文件 | 本轮不使用 plan | 保持当前 `refresh_file_parent`/直接向量路径 | 现有路径 |
+| `add_resources`、`vectors_only` | 本轮不使用 plan | 保持现有 DiffPlan 变化文件直接 embedding 路径 | 现有路径 |
+| `add_resources`、不要求 summarize 且不 build index | 本轮不使用 plan | 保持现有纯文件提交路径 | 无语义任务 |
+| resource/skill `write` | 本轮不使用 plan | 保持现有 freshness、file-only 与 tags 语义 | 现有 queued 路径 |
+| resource/skill `batch-write` | 本轮不使用 plan | 保持现有分组、freshness、coalesce 与 tags 语义 | 现有 queued 路径 |
+| `reindex` | 本轮不使用 plan | 保持直接构造旧 `SemanticMsg` 并 inline 调用 consumer 的现状 | 现有 inline 路径 |
+| memory 相关入口 | 本轮不使用 plan | 保持 `MemoryUpdater`、旧 memory Semantic 兼容和 reindex 行为 | 现状 |
+
+add_resources 本身不依赖 content-write 的 coalesce 降级逻辑，因此本轮不设计新的 `CoalescePolicy`，不拆分文件任务与目录聚合任务。新 plan 沿用 add_resources 当前的队列和等待语义；write/batch-write 的 stale 特判继续读取旧字段。
+
+### 18.6 memory 明确排除在本轮改造之外
+
+本轮不新增 `MemoryRefreshPlan`，不调整 `MemoryUpdater`，也不修改 `_process_memory_directory`、`use_hierarchical_aggregation` 或 memory reindex。原因是 memory 正常写入采用 schema/template 派生，而 add_resources 采用通用 LLM 目录 DAG；为了本轮 add_resources 解耦而统一二者，会扩大业务语义和测试矩阵。
+
+已确认的当前事实仅作为后续设计输入：正常 memory write/batch-write/delete 不走 memory 专用 Semantic 分支；memory reindex 显式选择通用 DAG；通用 `summarize(memory_uri)`、历史持久化消息或外部直接生产旧 `SemanticMsg` 仍可进入 `_process_memory_directory`。本轮必须保证这些旧路径在 `plan=None` 时行为完全不变。
+
+### 18.7 执行结果与父目录传播
+
+首次入队前无法知道新 L0 是否真正变化，因此父目录 freshness 不能完全前移。DAG 执行返回：
+
+```python
+@dataclass(frozen=True)
+class SemanticExecutionResult:
+    root_uri: str
+    abstract_body_changed: bool
+    overview_body_changed: bool
+    summarized_files: int
+    file_vectors_enqueued: int
+    directory_vectors_enqueued: int
+```
+
+worker 在成功执行后沿用现有父目录 freshness helper：
+
+```text
+abstract_body_changed=False
+  → NOOP，不增加父目录 pending
+
+abstract_body_changed=True
+  → 原子更新父目录 freshness
+  → MARK_PENDING：只记账
+  → REFRESH_NOW：沿用现有 `recursive=False` 父目录消息
+```
+
+对于新 add_resources plan，执行结束后把 `abstract_body_changed` 交给现有 `_enqueue_parent_refresh`；plan 的 propagation policy 决定是否调用它。现有 `content_copy`、write/batch-write、reindex 和旧消息仍保留原有 `generation_trigger/propagate_to_parent` 判断；本轮不抽取全局 `SemanticPropagationService`。
+
+### 18.8 EmbeddingQueue 的操作类型与查询取舍
+
+队列物理名称继续使用 `Embedding`，不新增或重命名队列。`EmbeddingMsg` 增加可选 operation；旧消息缺少 operation 时默认 `EMBED_AND_UPSERT`：
+
+```python
+class EmbeddingOperation(str, Enum):
+    EMBED_AND_UPSERT = "embed_and_upsert"
+    UPDATE_FIELDS = "update_fields"
+    DELETE = "delete"
+```
+
+| operation | 是否调用向量模型 | 是否允许再查向量库 | 行为 |
+|---|---:|---:|---|
+| `EMBED_AND_UPSERT` | 是 | 否 | 使用 plan 中必要非向量旧标量与本次新摘要/MD5构造完整记录，生成新 dense/sparse vector 后按稳定 ID full upsert |
+| `UPDATE_FIELDS` | 否 | 是 | 按稳定 ID 读取一次完整旧记录，合并白名单标量后写回，保留原 dense/sparse vector |
+| `DELETE` | 否 | 否 | 使用 plan 中精确 record ID 删除，缺失视为幂等成功 |
+
+本轮明确不把 dense/sparse vector 放进 `SemanticPlan`。第一次快照查询只扩展到 full upsert 必须保留的非向量业务标量；为少量标量更新分支预读并跨队列传输全量向量，会放大首次查询、消息体、持久化和重试成本。命中 `UPDATE_FIELDS` 时允许 Embedding worker 再读一次完整旧记录，这是有意接受的低频额外 I/O。
+
+典型的 `UPDATE_FIELDS` 场景是代码文件正文和 MD5 变化，但新旧摘要完全相同，且该文件的 embedding 输入使用摘要：此时不调用 embedding 模型，只更新 `md5`、需要后端保存时的 `content` 和 `updated_at`。现有 `partial_update=True` 已实现 get→merge→upsert，可作为首版执行通道；后续若各后端原生字段更新语义验证一致，再改为严格 `update_data`，不作为本轮前置。
+
+`UPDATE_FIELDS` 使用严格白名单，禁止修改 `id/uri/level/account_id/owner_user_id/vector/sparse_vector`。`EMBED_AND_UPSERT` 不再使用会重复 `get(id)` 的 `partial_update=True`：需要保留的轻量标量必须来自 plan 或当前 URI/ctx 的确定性推导，生成新向量后执行完整 upsert。若无法构造满足 schema 和 ACL 的完整记录，不得静默丢字段，应失败并保留原索引。
+
+计划到操作的映射：
+
+| 状态 | Semantic 处理 | Embedding operation |
+|---|---|---|
+| added file | 生成摘要，标记目录结构变化 | `EMBED_AND_UPSERT` L2 |
+| modified file，embedding 输入变化 | 生成摘要，按摘要变化决定目录聚合 | `EMBED_AND_UPSERT` L2 |
+| modified code file，新旧摘要相同 | 不聚合目录 | `UPDATE_FIELDS` L2 |
+| repair file | 生成摘要；旧摘要缺失时保守决定目录聚合 | `EMBED_AND_UPSERT` L2 |
+| deleted path | 不读正文，标记父目录结构变化 | 对已枚举旧记录发 `DELETE` |
+| structural replacement | 处理新 manifest 中的新类型，标记父目录结构变化 | 删除旧层级记录；新文件/目录按需 upsert |
+| orphan vector | 不进入语义 DAG | `DELETE` |
+| unchanged | 不进入执行集合 | 无；若仅缺 MD5且正文已确认相同，可选 `UPDATE_FIELDS` |
+
+同一 `(account_id, uri, level)` 在一个 plan 中只能编译出一种最终操作；entry 派生删除与 `orphan_vector_deletes` 必须先按 record ID 去重，发现 `DELETE` 与 `UPDATE_FIELDS/EMBED_AND_UPSERT` 冲突时必须在入 EmbeddingQueue 前失败。由于本轮不实现 generation fencing，旧 plan 的异步 DELETE/UPDATE/UPSERT 晚于新请求到达时仍可能破坏新索引；这是第 8.2/16.3 节已记录的最终一致性风险，本轮按用户确认先接受，不能把 operation 统一误称为并发正确性修复。
+
+### 18.9 兼容、故障与生命周期
+
+- `SemanticMsg` 的新 plan 字段可选；无 plan 的旧消息继续由当前逻辑消费，不要求一次性迁移全部生产者。部署顺序为先升级 consumer、再启用 add_resources 新 plan；回滚前先停新接入并排空新计划消息，不能让旧 consumer 处理其不理解的 plan。
+- 新 add_resources plan 只走 queued 路径；本轮不建设 queued/inline 通用执行框架。
+- local/AGFS artifact 在正式树提交且 SemanticMsg 成功持久化后即可由上层清理；若入队失败，上层清理并上报失败。新 plan 不携带 artifact。
+- 完整性门禁发生在 finalize/diff 前：目录解析结果中真正参加解析但含 `error` 的失败项会终止镜像更新；include/exclude、unsupported、source accessor 报告的合法跳过不算 parser failure。代码仓库批量 artifact 写入的失败列表同样必须向上传播，不能用成功文件数掩盖部分写失败。
+- 文件摘要或目录摘要的 LLM 请求失败沿用现有容错：记录并跳过当前节点，依赖该节点新摘要的聚合可能使用空值或停止传播，但不把整条 SemanticMsg 改为失败。该行为与“SemanticMsg 根本没有成功入队”不同；后者必须使 add_resources 失败。
+- 锁冲突重试不触发模型熔断；永久错误和输入过大终结；暂时性模型错误重新入队，沿用现有错误分类。
+- 第一阶段不改变已接受的一致性模型：文件提交成功后语义或 embedding 失败可长期不一致，由显式 reindex 修复。
+- 不在本阶段同时引入 generation fencing；旧异步任务覆盖新结果仍按第 16.3 节作为独立正确性工作。
+- 本轮不调整外部 `queue_status` 或 `context_count` 契约；`Embedding.processed` 暂时仍统计该队列处理的全部消息，包括 embed/upsert、标量更新和删除。为诊断增加内部分类计数/日志即可，不把指标重命名或响应结构调整纳入本轮。
+
+### 18.10 实施拆分
+
+| 阶段 | 工作 | 行为变化 |
+|---|---|---|
+| S1 | 新增 `SemanticPlan`、带状态 tree/index snapshot 模型与校验；`SemanticMsg` 增加可选 plan | 无 plan 的所有旧入口行为不变 |
+| S2 | 扩展现有 `EmbeddingMsg/Handler` 支持 `UPDATE_FIELDS/DELETE` | 旧消息默认 embed/upsert；新操作不调用模型 |
+| S3 | local 目录 add_resources 构造新 plan，消费端将 plan 映射到现有 DAG 参数 | local 行为等价，消息不再携带 artifact |
+| S4 | AGFS 目录 temp→target diff/apply 前移，复用现有 DiffPlan/ApplyResult | 新 add_resources consumer 不再同步文件树 |
+| S5 | 为带状态 tree snapshot 实现受影响路径最小 DAG | 增量不再访问无变化子树 |
+| S6 | 收敛 add_resources 新 plan 的 artifact 清理、锁 handoff、错误与观测 | 完成新链路生命周期 |
+| S7 | 运行 local/AGFS 正确性与性能 A/B | 满足访问计数和数据一致性验收 |
+
+每个阶段独立提交；S1/S2 先做兼容扩展，S4 文件同步前移与 S5 DAG 算法优化不得揉成同一个提交。S5 必须以访问计数证明裁剪生效，不能只用 embedding 数下降作为证据。write、batch-write、reindex、memory 的迁移另立后续方案，不作为这些阶段的前置或验收条件。
+
+### 18.11 测试与验收
+
+新增或调整以下测试：
+
+- `tests/storage/test_semantic_plan.py`：entry 状态、tree snapshot、outputs、orphan_vector_deletes 的序列化和校验，以及 `SemanticMsg(plan=None)` 旧消息兼容。
+- 同一测试验证新 consumer 可继续解析和执行没有 plan 的历史消息；新 plan 的回滚依赖受控排空，不要求旧 consumer 解释新 plan。
+- 向量 hydration 测试：DSL 覆盖全部 ID 时不调用 fetch；DSL 正常部分命中时只 fetch 缺失 ID；DSL 异常时不按 miss 继续；fallback 返回向量字段时进入 plan 前剔除；URI/level/tenant 不匹配时失败。
+- `tests/storage/test_embedding_queue_operations.py`：旧消息默认 embed/upsert；`UPDATE_FIELDS` 不调用模型且允许一次 get→merge→upsert；`DELETE` 按精确 ID 幂等删除；非法字段和同记录冲突拒绝。
+- `tests/storage/test_semantic_dag_incremental.py`：变化路径最小 DAG、未变化摘要复用、摘要不变停止传播、删除/目录替换。
+- `tests/storage/test_semantic_processor_target_preexisting.py`：新 add_resources plan 不执行 temp→target sync，只接收正式 root；旧消息同步行为保留。
+- `tests/utils/test_local_artifact_incremental.py` 与 AGFS 对应集成测试：两种产物后端在入队前得到相同正式树和 changes。
+- diff apply 边界测试：新 plan 路径只修改正式文件树，不直接调用向量 delete/update；deleted/structural 的旧记录保存在 entry，纯 orphan 进入 `orphan_vector_deletes`，三者最终都由 Embedding handler 执行。
+- `tests/utils/test_resource_processor_processing_mode.py`：目录 `semantic_and_vectors` 使用 plan；单文件、`vectors_only`、不建索引继续走非 plan 分支且行为不变。
+- 解析完整性和入队失败测试：部分目录解析失败在 finalize/diff 前终止；代码仓库 artifact 部分写失败不产生可提交结果；plan 入队失败清理 artifact、释放锁并向上报错；文件/目录语义请求失败仅跳过对应节点。
+- 现有 write、batch-write、reindex、memory 定向回归：证明 `plan=None` 时参数、队列消息和结果不变；不新增这些入口的 plan 测试。
+
+必须覆盖的最小 DAG 用例：
+
+```text
+repo/
+├── changed/a.py
+├── unchanged_a/...
+└── unchanged_b/...
+```
+
+只修改 `changed/a.py` 时断言：
+
+- Semantic worker 不为发现拓扑调用 `tree/ls`，也不访问 `unchanged_a`、`unchanged_b`；拓扑和直接聚合输入由 plan 提供。
+- 不读取未变化子树正文，不为其创建 file/dir DAG 节点。
+- 正常目录聚合不查询向量库，直接使用 plan 中当前聚合目录直接子项的 L2/L0 abstract；只有 `UPDATE_FIELDS` 可产生一次按 ID 的旧记录读取。
+- 文件摘要未变化时只产生一个文件 L2 embedding，目录 LLM 和父目录任务均为 0。
+- 文件摘要变化时只聚合直接父目录；更高祖先由 freshness 结果决定。
+- 最终业务文件、L0/L1/L2 URI 集合、MD5、ACL 和 tags 与全量正确执行结果一致。
+
+性能验收在现有 40 文件和 642 文件 frozen fixture 上增加确定性访问计数：`semantic_tree_ls_count`、`dag_file_nodes`、`dag_directory_nodes`、`semantic_vector_reads`、`embedding_update_prereads`、`file_body_reads`。新 plan 路径的 `semantic_tree_ls_count` 必须为 0；正常目录聚合的 `semantic_vector_reads` 必须为 0；`embedding_update_prereads` 只能等于实际 `UPDATE_FIELDS` 数量，且不得随无变化子树规模线性增长。模型调用、embedding 和 upsert 继续使用第 14.8 节口径对比。
+
+### 18.12 SemanticPlan 实施后 40 文件收益验证
+
+在第 14.7 节相同的 frozen 40 文件、shared HTTP 输入、local parse output、本地向量库和远程 S3 环境上，完成 SemanticPlan、同步前移与最小 DAG 后重新执行 initial、no-op、edit-one。每轮仍包含相同的 5 秒 benchmark 等待，且正式代码不增加 shared 重试。
+
+| 场景 | shared-only 基线 | SemanticPlan 优化 | 降幅 | 语义工作量 |
+|---|---:|---:|---:|---|
+| initial | 100.85s | 78.90s | 21.8% | 40 文件摘要、8 目录摘要、56 embedding |
+| no-op | 77.07s | 11.21s | 85.5% | 不入 SemanticQueue；0 摘要、0 embedding |
+| edit-one | 75.02s | 12.20s | 83.7% | 1 文件摘要、1 目录摘要、1 embedding |
+
+edit-one 的 Semantic DAG 从 shared-only 基线 33.92s 降至 1.34s，下降 96.1%；EmbeddingQueue 新消息从 27 条降至 1 条。与上一版仅 local artifact + MD5 diff 的 edit-one（38.06s、Semantic DAG 27.07s、9 条 embedding）相比，最小 DAG 又将端到端时间降至 12.20s，并把目录遍历和未变化分支的向量工作收敛掉。
+
+三轮均通过 40/40 正式文件、40/40 正文和 40/40 L2 校验，missing、unexpected、content mismatch 均为空，队列 error_count 为 0；no-op 前后 Semantic/Embedding processed 计数不增加。证据目录：`.scratch/ingest-profile/semantic-plan40-20260913-212633`。每个场景仍只有 1 个有效样本，数据用于功能和工作量收敛验证，不宣称 P95 或统计显著性。

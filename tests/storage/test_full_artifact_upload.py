@@ -22,7 +22,7 @@ class _FakeStore:
         seen = {}
         for stored in self._files:
             if stored.startswith(base):
-                rest = stored[len(base):]
+                rest = stored[len(base) :]
                 head = rest.split("/", 1)
                 name = head[0]
                 is_dir = len(head) > 1
@@ -37,10 +37,14 @@ class _FakeStore:
 class _FakeTarget:
     def __init__(self):
         self.written = {}
+        self.created_dirs = []
 
     async def write_file(self, rel_path, data):
         self.written[rel_path] = data
         return data
+
+    async def mkdir(self, rel_path):
+        self.created_dirs.append(rel_path)
 
 
 @pytest.mark.asyncio
@@ -52,6 +56,7 @@ async def test_full_upload_uploads_all_files_under_doc_root() -> None:
         {
             "/tmp/art/repository/a.py": b"aaa",
             "/tmp/art/repository/src/b.py": b"bbb",
+            "/tmp/art/repository/.image_mappings.json": b"{}",
         }
     )
     target = _FakeTarget()
@@ -66,3 +71,4 @@ async def test_full_upload_uploads_all_files_under_doc_root() -> None:
     assert target.written == {"a.py": b"aaa", "src/b.py": b"bbb"}
     assert result.md5_by_rel["a.py"] == content_md5(b"aaa")
     assert set(result.uploaded) == {"a.py", "src/b.py"}
+    assert target.created_dirs == ["src"]
