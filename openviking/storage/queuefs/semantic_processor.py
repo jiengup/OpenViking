@@ -7,7 +7,7 @@ import re
 import threading
 from contextlib import nullcontext
 from typing import Any, Dict, List, Optional, Set, Tuple
-from urllib.parse import quote, unquote, urlsplit
+from urllib.parse import unquote, urlsplit
 
 from openviking.observability.context import (
     bind_root_observability_context,
@@ -40,6 +40,7 @@ from openviking.storage.abstract_overview import (
     body_for_preview,
     deterministic_sample,
     freshness_metadata,
+    markdown_safe_viking_uri,
     plan_abstract_overview_refresh,
     write_abstract_overview,
 )
@@ -1090,7 +1091,7 @@ class SemanticProcessor(DequeueHandlerBase):
     def _markdown_link_target(dir_uri: str, entry_name: str) -> str:
         """Build a Markdown-safe target without changing the stored Viking URI."""
         entry_uri = VikingURI(dir_uri).join(entry_name).uri
-        return quote(entry_uri, safe=":/")
+        return markdown_safe_viking_uri(entry_uri)
 
     def _replace_link_references(self, generated_content: str, link_map: Dict[str, str]) -> str:
         """Resolve link placeholders (viking://input_sample_fN / cN) to real URIs.

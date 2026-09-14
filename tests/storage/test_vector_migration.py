@@ -129,6 +129,40 @@ directory: viking://resources/source/
     assert content_doc.body.strip() == "[chapter](viking://resources/target/chapter.md)"
 
 
+@pytest.mark.parametrize("mode", ["copy", "move"])
+def test_rewrite_vector_record_decodes_unicode_l1_uri_references(mode):
+    record = {
+        "id": "old-id",
+        "uri": "viking://resources/业务域",
+        "level": 1,
+        "vector": [0.1],
+        "abstract": "[chapter](viking://resources/%E4%B8%9A%E5%8A%A1%E5%9F%9F/%E7%AB%A0%E8%8A%82.md)",
+        "content": """---
+directory: viking://resources/业务域/
+---
+
+[chapter](viking://resources/%E4%B8%9A%E5%8A%A1%E5%9F%9F/%E7%AB%A0%E8%8A%82.md)
+""",
+        "created_at": 10,
+        "updated_at": 11,
+        "active_count": 9,
+    }
+
+    result = vector_migration.rewrite_vector_record(
+        record,
+        source_uri="viking://resources/业务域",
+        target_uri="viking://resources/归档域",
+        ctx=_ctx(),
+        mode=mode,
+        timestamp=123,
+    )
+
+    assert result["abstract"] == "[chapter](viking://resources/归档域/章节.md)"
+    content_doc = parse_abstract_overview(result["content"])
+    assert content_doc.metadata["directory"] == "viking://resources/归档域/"
+    assert content_doc.body.strip() == "[chapter](viking://resources/归档域/章节.md)"
+
+
 class FakeVectorStore:
     def __init__(self, records):
         self.records = [dict(record) for record in records]
