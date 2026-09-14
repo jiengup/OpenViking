@@ -368,9 +368,6 @@ export async function fetchAdminUsers(
       path: {
         account_id: accountId,
       },
-      query: {
-        limit: 500,
-      },
     }),
   )
   return result

@@ -18,6 +18,9 @@ import { toast } from 'sonner'
 
 import { Badge } from '#/components/ui/badge'
 import { Button } from '#/components/ui/button'
+import { Input } from '#/components/ui/input'
+import { UserPagination } from './-components/user-pagination'
+import { useUserList } from './-lib/use-user-list'
 import {
   Card,
   CardContent,
@@ -157,6 +160,15 @@ function UserManagementRoute() {
     ],
     retry: false,
   })
+  const users = usersQuery.data ?? []
+  const userList = useUserList(
+    users,
+    JSON.stringify([
+      adminConnection.baseUrl,
+      adminConnection.apiKey,
+      connection.accountId,
+    ]),
+  )
 
   const createUser = useMutation({
     mutationFn: (input: CreateUserInput) =>
@@ -302,7 +314,6 @@ function UserManagementRoute() {
     )
   }
 
-  const users = usersQuery.data ?? []
   const managerCount = users.filter(
     (user) => user.role === 'admin' || user.role === 'root',
   ).length
@@ -405,6 +416,14 @@ function UserManagementRoute() {
                 : 'management.memberListDescription',
             )}
           </CardDescription>
+          <Input
+            type="search"
+            className="max-w-sm"
+            aria-label={t('userList.search')}
+            placeholder={t('userList.search')}
+            value={userList.search}
+            onChange={(event) => userList.setSearch(event.target.value)}
+          />
         </CardHeader>
         <CardContent className="p-0">
           {usersQuery.isLoading ? (
@@ -419,11 +438,17 @@ function UserManagementRoute() {
                 {getErrorMessage(usersQuery.error)}
               </p>
             </div>
-          ) : users.length === 0 ? (
+          ) : userList.total === 0 ? (
             <div className="flex min-h-56 flex-col items-center justify-center gap-2 px-6 text-center">
-              <p className="font-medium">{t('empty.usersTitle')}</p>
+              <p className="font-medium">
+                {t(users.length ? 'userList.noResults' : 'empty.usersTitle')}
+              </p>
               <p className="text-sm text-muted-foreground">
-                {t('empty.usersDescription')}
+                {t(
+                  users.length
+                    ? 'userList.noResultsDescription'
+                    : 'empty.usersDescription',
+                )}
               </p>
             </div>
           ) : (
@@ -441,7 +466,7 @@ function UserManagementRoute() {
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {users.map((user) => {
+                  {userList.users.map((user) => {
                     const identityKey = `${user.accountId}:${user.userId}`
                     const isCurrentIdentity =
                       user.accountId === connection.accountId &&
@@ -649,6 +674,7 @@ function UserManagementRoute() {
                   })}
                 </TableBody>
               </Table>
+              <UserPagination {...userList} />
             </div>
           )}
         </CardContent>
