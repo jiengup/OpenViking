@@ -33,7 +33,7 @@ from openviking.session.memory.extract_loop import ExtractLoop
 from openviking.session.memory.memory_isolation_handler import MemoryIsolationHandler
 from openviking.session.memory.memory_type_registry import (
     MemoryTypeRegistry,
-    create_default_registry,
+    get_default_registry,
 )
 from openviking.session.memory.memory_updater import (
     ExtractContext,
@@ -139,7 +139,7 @@ class StreamingMemoryUpdater:
     _closed: bool = field(init=False, default=False, repr=False)
 
     def __post_init__(self) -> None:
-        self.registry = self.registry or create_default_registry()
+        self.registry = self.registry or get_default_registry()
         self._group_batchers = {}
         self._group_batchers_lock = asyncio.Lock()
         self._apply_lock = asyncio.Lock()
@@ -321,7 +321,7 @@ class StreamingMemoryUpdater:
         self, request: MemoryUpdateRequest
     ) -> tuple[MemoryUpdateRequest | None, MemoryUpdateRequest | None]:
         operations = request.operations
-        registry = self.registry or create_default_registry()
+        registry = self.registry or get_default_registry()
         append_ops: list[ResolvedOperation] = []
         merge_ops: list[ResolvedOperation] = []
         for op in list(operations.upsert_operations or []):
@@ -550,7 +550,7 @@ class StreamingMemoryUpdater:
                 operations=operations,
                 messages=_combined_request_messages(kind_requests),
                 ctx=kind_requests[0].ctx,
-                registry=self.registry or create_default_registry(),
+                registry=self.registry or get_default_registry(),
                 strict_extract_errors=any(
                     request.strict_extract_errors for request in kind_requests
                 ),
@@ -741,7 +741,7 @@ async def merge_memory_operations(
     merged_deletes: list[MemoryFile] = []
     merged_delete_replacements: dict[str, str] = {}
     merged_links = merge_link_lists(list(getattr(operations, "resolved_links", []) or []))
-    registry = registry or create_default_registry()
+    registry = registry or get_default_registry()
     merge_results = await asyncio.gather(
         *[
             merge_one_memory_type_operations(
@@ -847,7 +847,7 @@ async def merge_one_memory_type_operations(
     trace_console: bool = False,
     force_merge: bool = False,
 ) -> ResolvedOperations:
-    registry = registry or create_default_registry()
+    registry = registry or get_default_registry()
     schema = registry.get(memory_type)
     delete_files = list(delete_files or [])
     patch_count = len(operations)

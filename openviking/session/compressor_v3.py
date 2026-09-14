@@ -39,7 +39,7 @@ from openviking.session.memory.dataclass import (
     StoredLink,
 )
 from openviking.session.memory.memory_isolation_handler import MemoryIsolationHandler
-from openviking.session.memory.memory_type_registry import create_default_registry
+from openviking.session.memory.memory_type_registry import get_default_registry
 from openviking.session.memory.memory_updater import ExtractContext, write_stored_links
 from openviking.session.memory.session_extract_context_provider import (
     SessionExtractContextProvider,
@@ -423,7 +423,7 @@ class SessionCompressorV3:
     ):
         if not agent_evolution_enabled:
             effective_types = (
-                set(create_default_registry().list_names(include_disabled=False))
+                set(get_default_registry().list_names(include_disabled=False))
                 if allowed_memory_types is None
                 else set(allowed_memory_types)
             )
@@ -582,7 +582,7 @@ class SessionCompressorV3:
         archive_uri: str,
     ) -> Any:
         viking_fs = get_viking_fs()
-        registry = create_default_registry()
+        registry = get_default_registry()
         schema = registry.get(_CASES_MEMORY_TYPE)
         if schema is None or not schema.enabled:
             raise RuntimeError("cases memory schema is not available")
@@ -678,7 +678,7 @@ class SessionCompressorV3:
             logger.warning("VikingFS unavailable, skipping v3 memory extraction", exc_info=True)
             return _V3ExtractionResult()
 
-        registry = create_default_registry()
+        registry = get_default_registry()
         if allow_self_memory:
             await registry.initialize_memory_files(
                 ctx,
@@ -2022,7 +2022,7 @@ async def _render_case_links_from_template(
     if merged_links != mf.links:
         mf.links = merged_links
 
-    schema = create_default_registry().get(_CASES_MEMORY_TYPE)
+    schema = get_default_registry().get(_CASES_MEMORY_TYPE)
     content_template = schema.content_template if schema is not None else None
     await viking_fs.write_file(
         case_uri,

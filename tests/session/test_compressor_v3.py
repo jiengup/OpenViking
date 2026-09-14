@@ -424,7 +424,7 @@ async def test_v3_initializes_only_allowed_memory_files(monkeypatch):
         lambda: SimpleNamespace(),
     )
     monkeypatch.setattr(
-        "openviking.session.compressor_v3.create_default_registry",
+        "openviking.session.compressor_v3.get_default_registry",
         lambda: DummyRegistry(),
     )
 
@@ -815,7 +815,7 @@ async def test_v3_extract_uses_patch_merge_without_directory_lock(monkeypatch):
         lambda: SimpleNamespace(write_file=AsyncMock()),
     )
     monkeypatch.setattr(
-        "openviking.session.compressor_v3.create_default_registry",
+        "openviking.session.compressor_v3.get_default_registry",
         lambda: DummyRegistry(),
     )
     monkeypatch.setattr(
@@ -923,7 +923,7 @@ async def test_v3_extract_trains_only_canonical_case_after_patch_merge(monkeypat
 
     monkeypatch.setattr("openviking.session.compressor_v3.get_viking_fs", lambda: FakeFS())
     monkeypatch.setattr(
-        "openviking.session.compressor_v3.create_default_registry",
+        "openviking.session.compressor_v3.get_default_registry",
         lambda: DummyRegistry(),
     )
     monkeypatch.setattr(

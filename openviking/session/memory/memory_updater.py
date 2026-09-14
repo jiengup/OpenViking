@@ -790,9 +790,9 @@ class MemoryUpdater:
         if not memory_type:
             return False
         try:
-            from openviking.session.memory.memory_type_registry import create_default_registry
+            from openviking.session.memory.memory_type_registry import get_default_registry
 
-            updater = cls(registry=create_default_registry())
+            updater = cls(registry=get_default_registry())
             updater._viking_fs = viking_fs
             return await updater.generate_overview(memory_type, directory_uri, ctx)
         except Exception:
@@ -820,11 +820,11 @@ class MemoryUpdater:
         if not vikingdb or not bool(getattr(vikingdb, "has_queue_manager", False)):
             return False
         try:
-            from openviking.session.memory.memory_type_registry import create_default_registry
+            from openviking.session.memory.memory_type_registry import get_default_registry
 
             result = MemoryUpdateResult()
             result.add_written(uri)
-            updater = cls(registry=create_default_registry(), vikingdb=vikingdb)
+            updater = cls(registry=get_default_registry(), vikingdb=vikingdb)
             updater._viking_fs = viking_fs
             attempted = await updater._vectorize_memories(
                 result,

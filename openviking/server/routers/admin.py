@@ -42,7 +42,7 @@ from openviking.service.task_store import (
 from openviking.service.task_tracker import (
     get_task_tracker,
 )
-from openviking.session.memory.memory_type_registry import MemoryTypeRegistry
+from openviking.session.memory.memory_type_registry import get_default_registry
 from openviking.session.memory_policy import MemoryPolicy
 from openviking.storage.viking_fs import get_viking_fs
 from openviking_cli.exceptions import (
@@ -268,7 +268,7 @@ def _user_settings_result(
         else default_memory_policy
     )
     policy = MemoryPolicy.from_dict(memory_policy_config)
-    known_memory_types = set(MemoryTypeRegistry().list_names(include_disabled=False))
+    known_memory_types = set(get_default_registry().list_names(include_disabled=False))
     policy.validate_memory_types(known_memory_types)
     memory_policy = policy.to_dict()
     if policy.memory_types is None:
