@@ -184,11 +184,8 @@ class SemanticDagExecutor:
         generation_trigger: str = "semantic_refresh",
         aggregate_directory: bool = True,
         copy_source_uri: str = "",
-        prefer_target_files: bool = False,
         file_md5s: Optional[Dict[str, str]] = None,
         artifact_files: Optional[List[str]] = None,
-        artifact_store: Optional[Any] = None,
-        artifact_ref: Optional[Any] = None,
         file_abstracts: Optional[Dict[str, str]] = None,
         semantic_plan: Optional["SemanticPlan"] = None,
     ):
@@ -225,7 +222,6 @@ class SemanticDagExecutor:
         self._generation_trigger = generation_trigger
         self._aggregate_directory = aggregate_directory
         self._copy_source_uri = copy_source_uri
-        self._prefer_target_files = prefer_target_files
         self._task_context = get_task_context()
         self._telemetry = get_current_telemetry()
         self._stale = False
@@ -241,8 +237,6 @@ class SemanticDagExecutor:
         # re-vectorization records the fresh fingerprint instead of leaving it stale.
         self._file_md5s = dict(file_md5s or {})
         self._artifact_files = [path.strip("/") for path in (artifact_files or []) if path]
-        self._artifact_store = artifact_store
-        self._artifact_ref = artifact_ref
         self._file_abstracts = dict(file_abstracts or {})
         self._plan_entries_by_uri: Dict[str, "SemanticTreeEntry"] = {}
         self._plan_children: Dict[str, tuple[List[str], List[str]]] = {}
@@ -801,19 +795,6 @@ class SemanticDagExecutor:
                 file_paths.append(child_uri)
         return sorted(child_dirs), sorted(file_paths)
 
-    async def _read_artifact_file(self, file_path: str) -> Optional[bytes]:
-        if self._prefer_target_files:
-            return None
-        if not self._artifact_store or not self._artifact_ref or not self._root_uri:
-            return None
-        root = self._root_uri.rstrip("/")
-        if not file_path.startswith(f"{root}/"):
-            return None
-        rel_path = file_path[len(root) + 1 :]
-        artifact_doc_rel = str(getattr(self._artifact_ref, "resource_rel", "")).strip("/")
-        artifact_rel = f"{artifact_doc_rel}/{rel_path}" if artifact_doc_rel else rel_path
-        return await self._artifact_store.read_bytes(self._artifact_ref, artifact_rel)
-
     def _get_target_file_path(self, current_uri: str) -> Optional[str]:
         if not self._incremental_update or not self._target_uri or not self._root_uri:
             logger.warning(
@@ -1068,8 +1049,8 @@ class SemanticDagExecutor:
             else:
                 self._file_change_status[file_path] = True
             if summary_dict is None:
-                file_content = await self._read_artifact_file(file_path)
-                if file_content is None and hasattr(self._viking_fs, "read_file_bytes"):
+                file_content = None
+                if hasattr(self._viking_fs, "read_file_bytes"):
                     file_content = await self._viking_fs.read_file_bytes(file_path, ctx=self._ctx)
                 summary_kwargs: Dict[str, Any] = {
                     "llm_sem": self._llm_sem,

@@ -524,21 +524,6 @@ class SemanticProcessor(DequeueHandlerBase):
                             run_uri = msg.uri
                             changes = msg.changes
                             viking_fs = get_viking_fs()
-                            artifact_store = None
-                            artifact_ref = None
-                            if msg.artifact_ref and msg.artifact_files:
-                                from openviking.parse.output import (
-                                    ParseArtifactRef,
-                                    build_parse_output_store,
-                                )
-
-                                artifact_ref = ParseArtifactRef.from_dict(msg.artifact_ref)
-                                if artifact_ref.backend == "local":
-                                    parse_output = get_openviking_config().storage.parse_output
-                                    artifact_store = build_parse_output_store(
-                                        backend="local",
-                                        local_root=parse_output.resolved_local_root(),
-                                    )
                             if msg.target_uri:
                                 target_exists = await viking_fs.exists(
                                     msg.target_uri, ctx=current_ctx
@@ -603,13 +588,8 @@ class SemanticProcessor(DequeueHandlerBase):
                                 aggregate_directory=msg.aggregate_directory,
                                 copy_source_uri=msg.copy_source_uri,
                                 file_md5s=msg.file_md5s,
-                                artifact_store=artifact_store,
-                                artifact_ref=artifact_ref,
                                 artifact_files=msg.artifact_files,
                                 file_abstracts=msg.file_abstracts,
-                                prefer_target_files=(
-                                    artifact_ref is not None and artifact_ref.backend == "local"
-                                ),
                             )
                             await executor.run(run_uri)
                             self._cache_dag_stats(

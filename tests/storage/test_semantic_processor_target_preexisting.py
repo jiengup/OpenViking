@@ -329,7 +329,8 @@ async def test_local_incremental_reads_final_target_bytes_after_apply(monkeypatc
 
     await processor.on_dequeue(msg.to_dict())
 
-    assert _FakeDagExecutor.calls[0]["prefer_target_files"] is True
+    assert _FakeDagExecutor.calls[0]["artifact_files"] == ["a.md"]
+    assert _FakeDagExecutor.calls[0]["target_uri"] == "viking://resources/root"
 
 
 @pytest.mark.asyncio
@@ -378,7 +379,7 @@ async def test_local_initial_reads_final_target_bytes_after_apply(monkeypatch, t
 
     await processor.on_dequeue(msg.to_dict())
 
-    assert _FakeDagExecutor.calls[0]["prefer_target_files"] is True
+    assert _FakeDagExecutor.calls[0]["artifact_files"] == ["a.md"]
 
 
 @pytest.mark.asyncio

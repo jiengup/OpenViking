@@ -784,23 +784,18 @@ async def test_deleted_last_nested_file_still_refreshes_existing_ancestor(monkey
 
 
 @pytest.mark.asyncio
-async def test_artifact_snapshot_drives_dag_when_target_listing_is_empty(tmp_path, monkeypatch):
-    from openviking.parse.output import LocalParseOutputStore
-
+async def test_artifact_files_drive_dag_structure_when_target_listing_is_empty(tmp_path, monkeypatch):
     root_uri = "viking://resources/root"
-    store = LocalParseOutputStore(local_root=str(tmp_path / "artifacts"))
-    raw_ref = await store.create_artifact(root_type="dir")
-    from openviking.parse.output import ParseArtifactRef
-
-    ref = ParseArtifactRef(
-        backend=raw_ref.backend,
-        root=raw_ref.root,
-        resource_rel="repository",
-        root_type=raw_ref.root_type,
+    # artifact_files supplies the committed tree structure so the DAG does not
+    # depend on a target ls; file bytes are always read from the (already
+    # applied) target via viking_fs.
+    fake_fs = _FakeVikingFS(
+        tree={},
+        file_contents={
+            f"{root_uri}/a.txt": b"alpha",
+            f"{root_uri}/src/b.txt": b"beta",
+        },
     )
-    await store.write_bytes(ref, "repository/a.txt", b"alpha")
-    await store.write_bytes(ref, "repository/src/b.txt", b"beta")
-    fake_fs = _FakeVikingFS(tree={}, file_contents={})
     monkeypatch.setattr("openviking.storage.queuefs.semantic_dag.get_viking_fs", lambda: fake_fs)
     monkeypatch.setattr(
         "openviking.storage.queuefs.semantic_dag.get_openviking_config",
@@ -815,8 +810,6 @@ async def test_artifact_snapshot_drives_dag_when_target_listing_is_empty(tmp_pat
         max_concurrent_llm=2,
         ctx=ctx,
         artifact_files=["a.txt", "src/b.txt"],
-        artifact_store=store,
-        artifact_ref=ref,
     )
 
     await executor.run(root_uri)
@@ -867,17 +860,14 @@ async def test_direct_incremental_reuses_vector_abstract_without_overview(monkey
 
 
 @pytest.mark.asyncio
-async def test_missing_local_artifact_fails_instead_of_using_empty_summary(tmp_path, monkeypatch):
-    from openviking.parse.output import LocalParseOutputStore, ParseArtifactRef
-
+async def test_missing_target_file_fails_instead_of_using_empty_summary(tmp_path, monkeypatch):
     root_uri = "viking://resources/root"
-    store = LocalParseOutputStore(local_root=str(tmp_path / "artifacts"))
-    ref = ParseArtifactRef(
-        backend="local",
-        root=str(tmp_path / "artifacts" / "missing"),
-        resource_rel="repository",
-    )
-    fake_fs = _FakeVikingFS(tree={}, file_contents={})
+
+    class _MissingFileVikingFS(_FakeVikingFS):
+        async def read_file_bytes(self, path, ctx=None):
+            raise FileNotFoundError(path)
+
+    fake_fs = _MissingFileVikingFS(tree={}, file_contents={})
     monkeypatch.setattr("openviking.storage.queuefs.semantic_dag.get_viking_fs", lambda: fake_fs)
     monkeypatch.setattr(
         "openviking.storage.queuefs.semantic_dag.get_openviking_config",
@@ -889,8 +879,6 @@ async def test_missing_local_artifact_fails_instead_of_using_empty_summary(tmp_p
         max_concurrent_llm=2,
         ctx=RequestContext(user=UserIdentifier("acc1", "user1"), role=Role.USER),
         artifact_files=["a.txt"],
-        artifact_store=store,
-        artifact_ref=ref,
     )
 
     with pytest.raises(FileNotFoundError):
