@@ -103,18 +103,12 @@ async def rewrite_artifact_image_uris(
     target_root_uri: str,
 ) -> Set[str]:
     """Rewrite artifact markdown to final URIs before diffing or uploading."""
-    from openviking.parse.parsers.upload_utils import ARTIFACT_MANIFEST_NAME
+    from openviking.parse.output import read_artifact_manifest, write_artifact_manifest
 
     base = doc_rel.strip("/")
     rewritten: Set[str] = set()
-    md5_by_artifact_rel: Dict[str, str] = {}
-    try:
-        raw_manifest = await store.read_bytes(artifact_ref, ARTIFACT_MANIFEST_NAME)
-        loaded = json.loads(raw_manifest.decode("utf-8"))
-        if isinstance(loaded, dict):
-            md5_by_artifact_rel = {str(key): str(value) for key, value in loaded.items()}
-    except Exception:
-        pass
+    # Manifest is the md5 source of truth; refresh the entries we rewrite below.
+    md5_by_artifact_rel = await read_artifact_manifest(store, artifact_ref)
 
     async def _walk(
         rel_path: str,
@@ -176,11 +170,7 @@ async def rewrite_artifact_image_uris(
 
     await _walk(base)
     if rewritten:
-        await store.write_text(
-            artifact_ref,
-            ARTIFACT_MANIFEST_NAME,
-            json.dumps(md5_by_artifact_rel, ensure_ascii=False, sort_keys=True),
-        )
+        await write_artifact_manifest(store, artifact_ref, md5_by_artifact_rel)
     return rewritten
 
 

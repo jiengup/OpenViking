@@ -935,11 +935,12 @@ class ResourceProcessor:
                         )
                         if artifact_ref is None:
                             raise RuntimeError("semantic plan requires a parse artifact")
-                        from openviking.parse.output import AgfsParseOutputStore
+                        from openviking.parse.output import store_for_artifact_ref
 
-                        artifact_store = output_store or AgfsParseOutputStore(
-                            viking_fs=viking_fs,
-                            ctx=ctx,
+                        # Local mode already has a task-scoped store; agfs mode
+                        # builds the matching store from the ref's backend.
+                        artifact_store = output_store or store_for_artifact_ref(
+                            artifact_ref, viking_fs=viking_fs, ctx=ctx
                         )
                         local_artifact_doc_rel = self._artifact_doc_rel(artifact_ref, temp_uri)
                         semantic_source = self._semantic_source_metadata(
@@ -1214,6 +1215,8 @@ class ResourceProcessor:
                 return
             from openviking.parse.output import AgfsParseOutputStore
 
+            # Local mode reuses the processor's own store seam (test-injectable);
+            # agfs mode builds a temp-backed store on demand.
             output_store = (
                 self._build_parse_output_store()
                 if artifact_ref.backend == "local"

@@ -95,15 +95,12 @@ class SemanticProcessor(DequeueHandlerBase):
         try:
             if not msg.artifact_ref:
                 return
-            from openviking.parse.output import ParseArtifactRef, build_parse_output_store
+            from openviking.parse.output import ParseArtifactRef, store_for_artifact_ref
 
             artifact_ref = ParseArtifactRef.from_dict(msg.artifact_ref)
             if artifact_ref.backend != "local":
                 return
-            parse_output = get_openviking_config().storage.parse_output
-            store = build_parse_output_store(
-                backend="local", local_root=parse_output.resolved_local_root()
-            )
+            store = store_for_artifact_ref(artifact_ref)
             await store.cleanup(artifact_ref)
         except Exception as exc:
             logger.warning("Failed to clean local parse artifact: %s", exc)

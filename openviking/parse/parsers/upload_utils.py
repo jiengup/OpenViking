@@ -3,12 +3,12 @@
 """Shared upload utilities for directory and file uploading to VikingFS."""
 
 import asyncio
-import json
 import os
 from pathlib import Path
 from typing import Any, List, Optional, Set, Tuple, Union
 
 from openviking.parse.gitignore import GitignoreMatcher
+from openviking.parse.output import ARTIFACT_MANIFEST_NAME, write_artifact_manifest
 from openviking.parse.parsers.constants import (
     ADDITIONAL_TEXT_EXTENSIONS,
     CODE_EXTENSIONS,
@@ -104,12 +104,6 @@ def should_skip_file(
 
 
 _UPLOAD_CONCURRENCY = 8
-
-# Sidecar written at the artifact root in output-store mode: maps each uploaded
-# business file's artifact-relative path to the md5 of its final (encoding-
-# normalized) bytes. The incremental diff reads this so it can compare
-# fingerprints without re-reading file contents.
-ARTIFACT_MANIFEST_NAME = ".artifact_manifest.json"
 
 
 async def upload_directory(
@@ -256,11 +250,7 @@ async def upload_directory(
     # compare fingerprints without re-reading files. Only write it when every file
     # uploaded cleanly, so a partial manifest never masquerades as complete.
     if not any(errors):
-        await store.write_bytes(
-            artifact_ref,
-            ARTIFACT_MANIFEST_NAME,
-            json.dumps(md5_by_target, ensure_ascii=False).encode("utf-8"),
-        )
+        await write_artifact_manifest(store, artifact_ref, md5_by_target)
 
     uploaded_count = sum(1 for e in errors if e is None)
     return uploaded_count, warnings

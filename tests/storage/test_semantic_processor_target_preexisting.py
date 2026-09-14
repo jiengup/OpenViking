@@ -267,6 +267,15 @@ async def test_local_artifact_is_cleaned_after_semantic_success(monkeypatch, tmp
             )
         ),
     )
+    # store_for_artifact_ref resolves the local root from the config source.
+    monkeypatch.setattr(
+        "openviking_cli.utils.config.get_openviking_config",
+        lambda: SimpleNamespace(
+            storage=SimpleNamespace(
+                parse_output=SimpleNamespace(resolved_local_root=lambda: str(tmp_path))
+            )
+        ),
+    )
 
     processor = SemanticProcessor()
     processor._enqueue_parent_refresh = AsyncMock()

@@ -19,7 +19,6 @@ Assembling the plan then delegates to :func:`build_diff_plan`.
 
 from __future__ import annotations
 
-import json
 import logging
 from dataclasses import dataclass
 from typing import Any, Dict, Tuple
@@ -146,23 +145,16 @@ async def read_new_manifest(
     ``doc_rel`` (e.g. ``repository``) is stripped from every path so the manifest
     keys line up with the target resource tree, which has no such wrapper.
     """
-    from openviking.parse.parsers.upload_utils import ARTIFACT_MANIFEST_NAME
+    from openviking.parse.output import read_artifact_manifest
 
     manifest: Dict[str, NewEntry] = {}
     base = doc_rel.strip("/")
     prefix = f"{base}/" if base else ""
 
-    # md5 sidecar is keyed by artifact-relative path (pre-strip); read once.
-    md5_by_artifact_rel: Dict[str, str] = {}
-    try:
-        raw = await store.read_bytes(ref, ARTIFACT_MANIFEST_NAME)
-        loaded = json.loads(raw.decode("utf-8"))
-        if isinstance(loaded, dict):
-            md5_by_artifact_rel = {str(k): str(v) for k, v in loaded.items()}
-    except Exception:
-        # No manifest (legacy/agfs artifacts) or unreadable: fall back to empty
-        # md5 so the diff compares bytes instead of assuming equality.
-        md5_by_artifact_rel = {}
+    # md5 sidecar is keyed by artifact-relative path (pre-strip); read once. A
+    # missing manifest yields empty md5 so the diff compares bytes instead of
+    # assuming equality.
+    md5_by_artifact_rel = await read_artifact_manifest(store, ref)
 
     if root_is_file:
         return {"": NewEntry(md5=md5_by_artifact_rel.get(base, ""), is_dir=False)}

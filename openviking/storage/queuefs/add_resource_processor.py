@@ -72,23 +72,10 @@ class AddResourceProcessor(DequeueHandlerBase):
     async def _cleanup_prepared_artifact(self, msg: AddResourceMsg, ctx: RequestContext) -> None:
         if not msg.prepared or not isinstance(msg.prepared.get("artifact_ref"), dict):
             return
-        from openviking.parse.output import (
-            AgfsParseOutputStore,
-            ParseArtifactRef,
-            build_parse_output_store,
-        )
+        from openviking.parse.output import ParseArtifactRef, store_for_artifact_ref
 
         artifact_ref = ParseArtifactRef.from_dict(msg.prepared["artifact_ref"])
-        if artifact_ref.backend == "local":
-            from openviking_cli.utils.config import get_openviking_config
-
-            parse_output = get_openviking_config().storage.parse_output
-            store = build_parse_output_store(
-                backend="local",
-                local_root=parse_output.resolved_local_root(),
-            )
-        else:
-            store = AgfsParseOutputStore(viking_fs=self._viking_fs, ctx=ctx)
+        store = store_for_artifact_ref(artifact_ref, viking_fs=self._viking_fs, ctx=ctx)
         await store.cleanup(artifact_ref)
 
     async def _release_cancelled_resources(

@@ -1455,6 +1455,60 @@ class VikingVectorIndexBackend:
         backend = self._get_backend_for_context(ctx)
         return await backend.strict_count(filter=filter)
 
+    async def _strict_scan(
+        self,
+        ctx: RequestContext,
+        scope: FilterExpr,
+        *,
+        output_fields: List[str],
+        batch_size: int,
+        what: str,
+    ) -> AsyncIterator[Dict[str, Any]]:
+        """Yield every record under ``scope`` with strict count/cursor guarantees.
+
+        Consolidates the paginated scan skeleton shared by the incremental
+        readers: it pins the expected total up front, then walks cursor pages,
+        raising if a page ends early, overshoots the count, or the cursor repeats
+        or dies before the total is reached — so a truncated scan can never look
+        like "records absent". Per-record parsing/validation stays with the
+        caller; this only guarantees the traversal is complete.
+        """
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        expected_count = await self._strict_transfer_count(ctx, scope)
+        cursor: Optional[str] = None
+        scanned_count = 0
+        seen_cursors: set[str] = set()
+        while True:
+            page, next_cursor = await self._strict_transfer_page(
+                ctx,
+                scope,
+                limit=batch_size,
+                cursor=cursor,
+                output_fields=output_fields,
+            )
+            if not page and scanned_count < expected_count:
+                raise RuntimeError(
+                    f"{what} ended after {scanned_count} of {expected_count} records"
+                )
+            scanned_count += len(page)
+            if scanned_count > expected_count:
+                raise RuntimeError(
+                    f"{what} returned {scanned_count} records but count was {expected_count}"
+                )
+            for record in page:
+                yield record
+            if next_cursor is None:
+                if scanned_count == expected_count:
+                    return
+                raise RuntimeError(
+                    f"{what} cursor ended after {scanned_count} of {expected_count} records"
+                )
+            if next_cursor in seen_cursors:
+                raise RuntimeError(f"{what} cursor repeated: {next_cursor}")
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
+
     async def _strict_transfer_get(
         self, ctx: RequestContext, ids: List[str]
     ) -> List[Dict[str, Any]]:
@@ -1776,8 +1830,6 @@ class VikingVectorIndexBackend:
         batch_size: int = 100,
     ) -> Dict[str, Dict[str, Any]]:
         """Strictly load every L2 diff record below one target directory."""
-        if batch_size <= 0:
-            raise ValueError("batch_size must be positive")
         canonical_uri = resolve_uri(uri).uri.rstrip("/")
         scope = And(
             [
@@ -1786,60 +1838,22 @@ class VikingVectorIndexBackend:
                 Eq("level", 2),
             ]
         )
-        expected_count = await self._strict_transfer_count(ctx, scope)
         records: Dict[str, Dict[str, Any]] = {}
-        cursor: Optional[str] = None
-        scanned_count = 0
-        seen_cursors: set[str] = set()
-        while True:
-            page, next_cursor = await self._strict_transfer_page(
-                ctx,
-                scope,
-                limit=batch_size,
-                cursor=cursor,
-                output_fields=INCREMENTAL_DIFF_OUTPUT_FIELDS,
-            )
-            if not page and scanned_count < expected_count:
-                raise RuntimeError(
-                    f"Vector scan ended after {scanned_count} of {expected_count} L2 records "
-                    f"under {canonical_uri}"
-                )
-            scanned_count += len(page)
-            for record in page:
-                record_uri = str(record.get("uri") or "")
-                if not record_uri or not uri_in_transfer_scope(
-                    record_uri, canonical_uri, recursive=True
-                ):
-                    raise RuntimeError(
-                        f"Vector scan returned invalid L2 URI under {canonical_uri}: "
-                        f"{record_uri or '<missing>'}"
-                    )
-                if record_uri in records:
-                    raise RuntimeError(
-                        f"Vector scan returned duplicate L2 URI under {canonical_uri}: {record_uri}"
-                    )
-                records[record_uri] = {
-                    "md5": str(record.get("md5") or ""),
-                    "abstract": str(record.get("abstract") or ""),
-                }
-            if scanned_count > expected_count:
-                raise RuntimeError(
-                    f"Vector scan returned {scanned_count} L2 records but count was "
-                    f"{expected_count} under {canonical_uri}"
-                )
-            if next_cursor is None:
-                if scanned_count == expected_count:
-                    break
-                raise RuntimeError(
-                    f"Vector scan cursor ended after {scanned_count} of {expected_count} L2 "
-                    f"records under {canonical_uri}"
-                )
-            if next_cursor in seen_cursors:
-                raise RuntimeError(
-                    f"Vector scan cursor repeated under {canonical_uri}: {next_cursor}"
-                )
-            seen_cursors.add(next_cursor)
-            cursor = next_cursor
+        what = f"Vector scan under {canonical_uri}"
+        async for record in self._strict_scan(
+            ctx, scope, output_fields=INCREMENTAL_DIFF_OUTPUT_FIELDS, batch_size=batch_size, what=what
+        ):
+            record_uri = str(record.get("uri") or "")
+            if not record_uri or not uri_in_transfer_scope(
+                record_uri, canonical_uri, recursive=True
+            ):
+                raise RuntimeError(f"{what} returned invalid L2 URI: {record_uri or '<missing>'}")
+            if record_uri in records:
+                raise RuntimeError(f"{what} returned duplicate L2 URI: {record_uri}")
+            records[record_uri] = {
+                "md5": str(record.get("md5") or ""),
+                "abstract": str(record.get("abstract") or ""),
+            }
         return records
 
     async def get_incremental_inventory_under_uri(
@@ -1850,8 +1864,6 @@ class VikingVectorIndexBackend:
         batch_size: int = 100,
     ) -> Dict[str, Dict[str, Any]]:
         """Strictly load lightweight L0/L1/L2 metadata below a resource root."""
-        if batch_size <= 0:
-            raise ValueError("batch_size must be positive")
         canonical_uri = resolve_uri(uri).uri.rstrip("/")
         scope = And(
             [
@@ -1860,70 +1872,38 @@ class VikingVectorIndexBackend:
                 In("level", [0, 1, 2]),
             ]
         )
-        expected_count = await self._strict_transfer_count(ctx, scope)
         records: Dict[str, Dict[str, Any]] = {}
-        cursor: Optional[str] = None
-        scanned_count = 0
-        seen_cursors: set[str] = set()
-        while True:
-            page, next_cursor = await self._strict_transfer_page(
-                ctx,
-                scope,
-                limit=batch_size,
-                cursor=cursor,
-                output_fields=INCREMENTAL_INVENTORY_OUTPUT_FIELDS,
-            )
-            if not page and scanned_count < expected_count:
+        what = f"Incremental inventory under {canonical_uri}"
+        async for record in self._strict_scan(
+            ctx,
+            scope,
+            output_fields=INCREMENTAL_INVENTORY_OUTPUT_FIELDS,
+            batch_size=batch_size,
+            what=what,
+        ):
+            record_id = str(record.get("id") or "")
+            record_uri = str(record.get("uri") or "")
+            try:
+                level = int(record.get("level"))
+            except (TypeError, ValueError):
+                level = -1
+            if (
+                not record_id
+                or level not in {0, 1, 2}
+                or not uri_in_transfer_scope(record_uri, canonical_uri, recursive=True)
+            ):
                 raise RuntimeError(
-                    f"Incremental inventory ended after {scanned_count} of "
-                    f"{expected_count} records under {canonical_uri}"
+                    f"{what} returned an invalid record: id={record_id or '<missing>'} "
+                    f"uri={record_uri or '<missing>'} level={level}"
                 )
-            scanned_count += len(page)
-            for record in page:
-                record_id = str(record.get("id") or "")
-                record_uri = str(record.get("uri") or "")
-                try:
-                    level = int(record.get("level"))
-                except (TypeError, ValueError):
-                    level = -1
-                if (
-                    not record_id
-                    or level not in {0, 1, 2}
-                    or not uri_in_transfer_scope(record_uri, canonical_uri, recursive=True)
-                ):
-                    raise RuntimeError(
-                        "Incremental inventory returned an invalid record under "
-                        f"{canonical_uri}: id={record_id or '<missing>'} "
-                        f"uri={record_uri or '<missing>'} level={level}"
-                    )
-                if record_id in records:
-                    raise RuntimeError(
-                        f"Incremental inventory returned duplicate record id: {record_id}"
-                    )
-                records[record_id] = {
-                    "id": record_id,
-                    "uri": record_uri,
-                    "level": level,
-                    "md5": str(record.get("md5") or ""),
-                }
-            if scanned_count > expected_count:
-                raise RuntimeError(
-                    f"Incremental inventory returned {scanned_count} records but count was "
-                    f"{expected_count} under {canonical_uri}"
-                )
-            if next_cursor is None:
-                if scanned_count == expected_count:
-                    break
-                raise RuntimeError(
-                    f"Incremental inventory cursor ended after {scanned_count} of "
-                    f"{expected_count} records under {canonical_uri}"
-                )
-            if next_cursor in seen_cursors:
-                raise RuntimeError(
-                    f"Incremental inventory cursor repeated under {canonical_uri}: {next_cursor}"
-                )
-            seen_cursors.add(next_cursor)
-            cursor = next_cursor
+            if record_id in records:
+                raise RuntimeError(f"{what} returned duplicate record id: {record_id}")
+            records[record_id] = {
+                "id": record_id,
+                "uri": record_uri,
+                "level": level,
+                "md5": str(record.get("md5") or ""),
+            }
         return records
 
     async def hydrate_incremental_records(

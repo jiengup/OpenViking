@@ -23,12 +23,11 @@ incomplete snapshot never carries deletions — see build_diff_plan).
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Sequence, Tuple
 
-from openviking.parse.parsers.upload_utils import ARTIFACT_MANIFEST_NAME
+from openviking.parse.output import read_artifact_manifest
 from openviking.storage.viking_fs._diff_plan import CONTROL_BASENAMES, DiffPlan
 
 logger = logging.getLogger(__name__)
@@ -95,11 +94,11 @@ class ApplyResult:
 
 
 async def _upload(rel_path: str, *, store, artifact_ref, target) -> None:
-    """Read one file from the store and write it to the target, returning md5.
+    """Read one file from the store and write it to the target.
 
-    Runs as an independent task so callers can fan out uploads concurrently; the
-    result is returned rather than mutating shared state so parallel writers do
-    not race on the ``ApplyResult`` collections.
+    Runs as an independent task so callers can fan out uploads concurrently. md5
+    is not derived here — it comes from the artifact manifest (source of truth),
+    so this only moves bytes and never mutates shared state.
     """
     data = await store.read_bytes(artifact_ref, rel_path)
     await target.write_file(rel_path, data)
@@ -114,12 +113,12 @@ async def _upload_concurrent(
     result: ApplyResult,
     concurrency: int | None = None,
 ) -> None:
-    """Upload ``rel_paths`` with bounded concurrency, recording md5 per file.
+    """Upload ``rel_paths`` with bounded concurrency, recording each uploaded path.
 
     Each file is an independent remote write, so uploads fan out under a
     semaphore instead of one serial await. The first failure propagates (via
     ``gather``) so the caller still marks the task failed rather than reporting
-    partial success as done.
+    partial success as done. md5 is sourced from the manifest by the caller.
     """
     if not rel_paths:
         return
@@ -127,9 +126,7 @@ async def _upload_concurrent(
 
     async def _one(rel_path: str) -> str:
         async with sem:
-            md5 = await _upload(
-                rel_path, store=store, artifact_ref=artifact_ref, target=target
-            )
+            await _upload(rel_path, store=store, artifact_ref=artifact_ref, target=target)
         return rel_path
 
     for rel_path in await asyncio.gather(*(_one(rel) for rel in rel_paths)):
@@ -160,10 +157,6 @@ async def apply_diff_plan(
         md5_by_rel=dict(plan.new_md5s),
         abstracts_by_rel=dict(plan.file_abstracts),
     )
-    body_compare_equal = 0
-    body_compare_modified = 0
-    body_compare_read_failed = 0
-    body_compare_samples: List[str] = []
 
     # Structural replacements: delete the stale node up front. The replacement is
     # written by its added/modified classification below.
@@ -194,15 +187,15 @@ async def apply_diff_plan(
         result=result,
     )
 
+    # needs_body_compare: md5 was unknown on some side, so read both bodies once
+    # and resolve unchanged vs modified. Track the outcome for the no-op audit.
+    body_compare_equal = 0
     for rel_path in plan.needs_body_compare:
         new_bytes = await store.read_bytes(artifact_ref, rel_path)
         try:
             old_bytes = await target.read_file(rel_path)
-        except Exception as exc:
+        except Exception:
             old_bytes = None
-            body_compare_read_failed += 1
-            if len(body_compare_samples) < 5:
-                body_compare_samples.append(f"{rel_path}(read_failed={exc})")
         if old_bytes is not None and old_bytes == new_bytes:
             result.unchanged.append(rel_path)
             body_compare_equal += 1
@@ -211,19 +204,13 @@ async def apply_diff_plan(
         result.uploaded.append(rel_path)
         result.modified.append(rel_path)
         result.md5_by_rel[rel_path] = plan.new_md5s.get(rel_path, "")
-        body_compare_modified += 1
-        if len(body_compare_samples) < 5:
-            body_compare_samples.append(f"{rel_path}(content_different)")
 
     if plan.needs_body_compare:
         logger.info(
-            "[IncrementalDiff] body_compare total=%d equal=%d modified=%d "
-            "read_failed=%d samples=%s",
+            "[IncrementalDiff] body_compare total=%d equal=%d modified=%d",
             len(plan.needs_body_compare),
             body_compare_equal,
-            body_compare_modified,
-            body_compare_read_failed,
-            body_compare_samples,
+            len(plan.needs_body_compare) - body_compare_equal,
         )
 
     for rel_path in plan.repair:
@@ -277,22 +264,20 @@ async def apply_full_artifact_upload(
     Initial import is "the plan is all added": there is no existing target to
     diff against, so every business file below the document root is uploaded.
     Paths are made target-relative by stripping the ``doc_rel`` prefix (e.g. the
-    ``repository`` wrapper), and md5 is computed from the final stored bytes at
-    the upload point, exactly like the incremental path.
+    ``repository`` wrapper), and md5 is sourced from the artifact manifest sidecar
+    (source of truth), exactly like the incremental path.
     """
     result = ApplyResult()
-    manifest_md5s: Dict[str, str] = {}
     base = doc_rel.strip("/")
     prefix = f"{base}/" if base else ""
-    try:
-        raw_manifest = await store.read_bytes(artifact_ref, ARTIFACT_MANIFEST_NAME)
-        loaded_manifest = json.loads(raw_manifest.decode("utf-8"))
-        if isinstance(loaded_manifest, dict):
-            manifest_md5s = {
-                (key[len(prefix) :] if prefix and key.startswith(prefix) else key): str(value)
-                for key, value in loaded_manifest.items()
-            }
-    except Exception:
+    # md5 manifest is keyed by artifact-relative path (with the doc_rel prefix);
+    # strip it so keys align with the target-relative upload paths below.
+    raw_manifest = await read_artifact_manifest(store, artifact_ref)
+    manifest_md5s: Dict[str, str] = {
+        (key[len(prefix) :] if prefix and key.startswith(prefix) else key): value
+        for key, value in raw_manifest.items()
+    }
+    if not raw_manifest:
         logger.info(
             "[IncrementalDiff] artifact manifest unavailable during full upload; vector md5 remains empty"
         )

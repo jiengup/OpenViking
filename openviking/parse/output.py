@@ -23,17 +23,23 @@ Design notes:
 from __future__ import annotations
 
 import asyncio
+import json
 import shutil
 import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from openviking.utils.path_safety import safe_join_viking_uri, sanitize_relative_viking_path
 
 _BACKENDS = frozenset({"agfs", "local"})
 _ROOT_TYPES = frozenset({"dir", "file"})
+
+# Sidecar at the artifact root mapping each business file's artifact-relative
+# path to the md5 of its final (encoding-normalized) bytes. The incremental diff
+# reads this so it can compare fingerprints without re-reading file contents.
+ARTIFACT_MANIFEST_NAME = ".artifact_manifest.json"
 
 
 @dataclass(frozen=True)
@@ -380,9 +386,59 @@ def build_parse_output_store(
     raise ValueError(f"unsupported parse output backend: {backend}")
 
 
+def store_for_artifact_ref(
+    ref: ParseArtifactRef,
+    *,
+    viking_fs: Any = None,
+    ctx: Any = None,
+) -> ParseOutputStore:
+    """Return the store that owns ``ref``, resolving the local root from config.
+
+    Callers that receive a serialized ref across the queue (semantic worker,
+    add-resource cleanup, post-process) must reconstruct the matching backend;
+    this centralizes that mapping so the local-root lookup lives in one place.
+    """
+    if ref.backend == "local":
+        from openviking_cli.utils.config import get_openviking_config
+
+        parse_output = get_openviking_config().storage.parse_output
+        return build_parse_output_store(
+            backend="local", local_root=parse_output.resolved_local_root()
+        )
+    return AgfsParseOutputStore(viking_fs=viking_fs, ctx=ctx)
+
+
+async def read_artifact_manifest(store: ParseOutputStore, ref: ParseArtifactRef) -> Dict[str, str]:
+    """Return the md5 manifest (artifact-relative path -> md5), or empty if absent.
+
+    A missing/unreadable/malformed manifest yields ``{}`` so the incremental diff
+    falls back to comparing file bytes instead of assuming equality.
+    """
+    try:
+        raw = await store.read_bytes(ref, ARTIFACT_MANIFEST_NAME)
+        loaded = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(loaded, dict):
+        return {}
+    return {str(key): str(value) for key, value in loaded.items()}
+
+
+async def write_artifact_manifest(
+    store: ParseOutputStore, ref: ParseArtifactRef, md5_by_rel: Dict[str, str]
+) -> None:
+    """Persist the md5 manifest at the artifact root using the shared encoding."""
+    await store.write_bytes(
+        ref,
+        ARTIFACT_MANIFEST_NAME,
+        json.dumps(md5_by_rel, ensure_ascii=False, sort_keys=True).encode("utf-8"),
+    )
+
+
 # Re-exported so callers importing the sanitizer alongside the store stay in one
 # module; keeps parser edits from sprinkling path_safety imports everywhere.
 __all__ = [
+    "ARTIFACT_MANIFEST_NAME",
     "ArtifactEntry",
     "AgfsParseOutputStore",
     "LocalParseOutputStore",
@@ -390,6 +446,9 @@ __all__ = [
     "ParseOutputStore",
     "ResolvedDocRoot",
     "build_parse_output_store",
+    "read_artifact_manifest",
     "resolve_artifact_doc_root",
     "sanitize_relative_viking_path",
+    "store_for_artifact_ref",
+    "write_artifact_manifest",
 ]
