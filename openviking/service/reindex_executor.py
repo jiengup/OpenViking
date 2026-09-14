@@ -31,6 +31,7 @@ from openviking.service.task_tracker import get_task_tracker
 from openviking.service.task_work_index import bind_task_context
 from openviking.session.memory.utils.memory_file_utils import MemoryFileUtils
 from openviking.storage.abstract_overview import body_for_preview, embedding_text_for_body
+from openviking.storage.errors import ResourceBusyError
 from openviking.storage.expr import And, Eq, Or, PathScope
 from openviking.storage.queuefs.embedding_msg_converter import EmbeddingMsgConverter
 from openviking.storage.queuefs.semantic_msg import SemanticMsg
@@ -508,14 +509,25 @@ class ReindexExecutor:
         if telemetry_id:
             wait_tracker.register_request(telemetry_id)
 
-        acquire_lock = service.viking_fs._async_agfs.pathlock_acquire_tree
+        # prune_orphans only touches the vector store. A missing target has
+        # nothing on disk to protect, and acquiring a lock there would create
+        # the directory just to hold lock metadata. Refuse only when another
+        # owner is mid-write at that name (e.g. add_resource reserving it).
+        lease = None
         if mode != "prune_orphans" or await service.viking_fs.exists(uri, ctx=ctx):
+            acquire_lock = service.viking_fs._async_agfs.pathlock_acquire_tree
             stat = await service.viking_fs.stat(uri, ctx=ctx, skip_count=True)
             if not stat.get("isDir", stat.get("is_dir")):
                 acquire_lock = service.viking_fs._async_agfs.pathlock_acquire_exact
-        lease = await acquire_lock(path)
+            lease = await acquire_lock(path)
+        elif await service.viking_fs._async_agfs.pathlock_is_locked(path):
+            raise ResourceBusyError(f"Resource is being processed: {uri}", uri=uri)
         try:
-            borrowed = await service.viking_fs._async_agfs.pathlock_as_borrowed(lease)
+            borrowed = (
+                await service.viking_fs._async_agfs.pathlock_as_borrowed(lease)
+                if lease is not None
+                else None
+            )
             run = _ReindexRunContext(
                 ctx=ctx,
                 counters=counters,
@@ -577,7 +589,8 @@ class ReindexExecutor:
                     wait_tracker.build_queue_status(telemetry_id),
                 )
         finally:
-            await service.viking_fs._async_agfs.pathlock_release(lease)
+            if lease is not None:
+                await service.viking_fs._async_agfs.pathlock_release(lease)
             if telemetry_id:
                 wait_tracker.cleanup(telemetry_id)
 
