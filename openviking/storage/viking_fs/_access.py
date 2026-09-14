@@ -83,8 +83,8 @@ class _AccessMixin:
     }
     _NO_VECTOR_DERIVED = frozenset({".relations.json", ".ovgitignore"})
 
-    def set_user_deletion_guard(self, guard: Optional[Callable[[str, str], bool]]) -> None:
-        self._user_deletion_guard = guard
+    def set_deletion_guard(self, guard: Optional[Callable[[str, str], bool]]) -> None:
+        self._deletion_guard = guard
 
     @staticmethod
     def _default_ctx() -> RequestContext:
@@ -227,7 +227,7 @@ class _AccessMixin:
         if action is AclAction.READ:
             return
 
-        self._ensure_user_not_deleting(real_ctx)
+        self._ensure_identity_not_deleting(real_ctx)
         for uri in uris:
             self._safe_uri_parts(uri)
             if uri == "viking://" and real_ctx.role == Role.USER:
@@ -360,10 +360,10 @@ class _AccessMixin:
     async def delete_acl(self, uri: str, ctx: Optional[RequestContext] = None) -> Dict[str, Any]:
         return await self.set_acl(uri, [], acl_mode=AclMode.INHERIT, ctx=ctx)
 
-    def _ensure_user_not_deleting(self, ctx: RequestContext) -> None:
-        guard = getattr(self, "_user_deletion_guard", None)
+    def _ensure_identity_not_deleting(self, ctx: RequestContext) -> None:
+        guard = getattr(self, "_deletion_guard", None)
         if ctx.role != Role.ROOT and guard is not None and guard(ctx.account_id, ctx.user.user_id):
-            raise FailedPreconditionError("User deletion is in progress")
+            raise FailedPreconditionError("Identity deletion is in progress")
 
     def _ensure_supported_delete_namespace(self, normalized_uri: str) -> None:
         parts = [p for p in normalized_uri[len("viking://") :].strip("/").split("/") if p]

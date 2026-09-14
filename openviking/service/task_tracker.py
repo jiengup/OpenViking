@@ -902,6 +902,17 @@ class TaskTracker:
 
         return await self._dispatcher.run(load)
 
+    def forget_account_tasks(self, account_id: str) -> None:
+        """Invalidate snapshots after executions settle and account storage is removed."""
+        with self._lock:
+            task_ids = [
+                task_id for task_id, task in self._tasks.items() if task.account_id == account_id
+            ]
+            for task_id in task_ids:
+                del self._tasks[task_id]
+        for task_id in task_ids:
+            self._work_index.clear_failure(task_id)
+
     async def delete_user_tasks(self, account_id: str, user_id: str) -> int:
         """Delete terminal task records for one user from storage and cache."""
         self._validate_owner(account_id, user_id)
@@ -1056,7 +1067,7 @@ class TaskTracker:
         task_type: Optional[str] = None,
         status: Optional[str] = None,
         resource_id: Optional[str] = None,
-        limit: int = 50,
+        limit: Optional[int] = 50,
         account_id: Optional[str] = None,
         user_id: Optional[str] = None,
         include_internal: bool = True,
@@ -1079,7 +1090,7 @@ class TaskTracker:
         task_type: Optional[str],
         status: Optional[str],
         resource_id: Optional[str],
-        limit: int,
+        limit: Optional[int],
         account_id: Optional[str],
         user_id: Optional[str],
         include_internal: bool,

@@ -471,17 +471,18 @@ ov --sudo admin list-accounts --limit 50 --page 2
 
 #### 1. API 实现介绍
 
-删除工作区及其所有关联用户和数据（仅 ROOT）。
+异步删除工作区及其所有关联用户和数据（仅 ROOT）。接口返回 HTTP `202` 和 `task_id`，不等待数据清理完成。
 
 **处理流程：**
-1. 验证请求者具有 ROOT 权限
-2. 级联删除账户下的所有 AGFS 数据（`user/` 和 `resources/`；sessions 位于 `user/` 下）
-3. 级联删除向量数据库中该账户的所有记录
-4. 最后删除账户元数据和所有用户密钥
+1. 验证 ROOT 权限，持久化账号删除标记，立即拒绝账号密钥和普通请求；创建系统作用域的 `account_delete` Task 并持久化入队，返回 `status=deleting` 和 `task_id`
+2. 后台停止该账号的 Watch 和业务任务，清理向量、OAuth 授权、用量审计数据和整个账号 AGFS 目录（包含账号内的任务记录）
+3. 清理成功后移除账号注册记录，将 Task 标记为 `completed`
+
+账号和用户清理共用一个串行消费的数据清理队列。账号任务直接清理整个账号。后续用户清理任务发现目标已删除时，完成并跳过；旧任务也不会清理重建的同名账号或用户。归属该账号的任务记录一并删除，后续消息不会重建这些记录；系统作用域的清理 Task 仍可查询。
 
 **代码入口：**
 - `openviking/server/routers/admin.py:delete_account` - HTTP 路由
-- `openviking/server/api_keys/new.py:APIKeyManager.delete_account` - 核心实现
+- `openviking/service/deletion.py:DeletionService.delete` - 核心实现
 - `openviking_cli/client/sync_http.py:SyncHTTPClient.admin_delete_account` - Python SDK
 
 #### 2. 接口和参数说明
@@ -494,7 +495,12 @@ ov --sudo admin list-accounts --limit 50 --page 2
 
 **说明：**
 - 删除操作是不可逆的，会级联删除该账户下的所有数据
-- 如果部分数据删除失败，会记录警告日志并继续删除其他数据
+- 清理失败时，Task 标记为 `failed` 并记录错误原因；账号保持 `deleting`
+- 正在删除时重复请求返回同一个 Task；失败后再次请求会创建重试 Task，处理剩余数据
+- 服务重启后恢复未完成任务；删除期间不能重建同名账号，也不能恢复账号使用
+- 向量按账号条件循环扫描、删除和检查，每次删除请求最多 100 条，直到清空，不受原来的单次 10 万条总量上限限制
+- 账号列表中的 `status` 为 `active` 或 `deleting`；删除中的账号同时返回 `task_id`
+- 使用 ROOT 调用 `GET /api/v1/tasks/{task_id}` 查看状态和错误；清理任务只使用 `pending`、`running`、`completed`、`failed` 状态，不细分清理阶段，只有 `completed` 表示清理完成
 
 #### 3. 使用示例
 
@@ -518,7 +524,7 @@ client = ov.SyncHTTPClient(api_key="<root-key>")
 client.initialize()
 
 result = client.admin_delete_account(account_id="acme")
-print(f"Account deleted: {result['deleted']}")
+print(f"Cleanup task: {result['task_id']}")
 ```
 
 **TypeScript SDK**
@@ -534,7 +540,7 @@ result, err := client.AdminDeleteAccount(ctx, "acme")
 if err != nil {
     return err
 }
-fmt.Println(result["deleted"])
+fmt.Println(result["task_id"])
 ```
 
 **CLI**
@@ -542,6 +548,7 @@ fmt.Println(result["deleted"])
 ```bash
 # 需要 ROOT 权限，使用 --sudo
 ov --sudo admin delete-account acme
+ov --sudo task status <task_id>
 ```
 
 **响应示例**
@@ -550,7 +557,9 @@ ov --sudo admin delete-account acme
 {
   "status": "ok",
   "result": {
-    "deleted": true
+    "account_id": "acme",
+    "status": "deleting",
+    "task_id": "550e8400-e29b-41d4-a716-446655440000"
   },
   "time": 0.1
 }
@@ -825,7 +834,7 @@ ov admin list-users acme --limit 50 --page 2
 
 **代码入口：**
 - `openviking/server/routers/admin.py:remove_user` - HTTP 路由
-- `openviking/service/user_deletion.py:UserDeletionService.delete_user` - 核心实现
+- `openviking/service/deletion.py:DeletionService.delete` - 核心实现
 - `openviking_cli/client/sync_http.py:SyncHTTPClient.admin_remove_user` - Python SDK
 
 #### 2. 接口和参数说明

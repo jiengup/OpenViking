@@ -525,28 +525,38 @@ class CollectionAdapter(ABC):
         *,
         ids: Optional[list[str]] = None,
         filter: Optional[Dict[str, Any] | FilterExpr] = None,
-        limit: int = 100000,
     ) -> int:
+        """Delete explicit IDs, or exhaust a filtered scope in bounded batches."""
         coll = self.get_collection()
-        delete_ids = list(ids or [])
-        if not delete_ids and filter is not None:
-            matched = self.query(
-                filter=filter,
-                limit=limit,
-                output_fields=["id"],
-            )
-            delete_ids = [record["id"] for record in matched if record.get("id")]
-
-        if not delete_ids:
+        batch_size = self._DATA_BATCH_SIZE or 100
+        if ids is not None:
+            for start in range(0, len(ids), batch_size):
+                coll.delete_data(ids[start : start + batch_size])
+            return len(ids)
+        if filter is None:
             return 0
 
-        batch_size = self._DATA_BATCH_SIZE
-        if batch_size and len(delete_ids) > batch_size:
-            for i in range(0, len(delete_ids), batch_size):
-                coll.delete_data(delete_ids[i : i + batch_size])
-        else:
-            coll.delete_data(delete_ids)
-        return len(delete_ids)
+        deleted = 0
+        while True:
+            # Re-read the first remaining page: advancing an offset while
+            # deleting would skip records. Scalar search enumerates records;
+            # approximate vector search cannot establish deletion completeness.
+            matched = self.query(
+                filter=filter,
+                limit=batch_size,
+                output_fields=["id"],
+                order_by="updated_at",
+                order_desc=False,
+            )
+            delete_ids = [record["id"] for record in matched]
+            if not delete_ids:
+                if self.count(filter) != 0:
+                    raise RuntimeError("Vector scan ended with records still in the deletion scope")
+                return deleted
+            self.delete(ids=delete_ids)
+            if self.get(delete_ids):
+                raise RuntimeError("Vector deletion left records in the requested batch")
+            deleted += len(delete_ids)
 
     @staticmethod
     def _coerce_int(value: Any) -> Optional[int]:
@@ -583,7 +593,7 @@ class CollectionAdapter(ABC):
         if parsed_total is not None:
             return parsed_total
 
-        return 0
+        raise RuntimeError("Vector backend returned an invalid count result")
 
     def search_by_keywords(
         self,

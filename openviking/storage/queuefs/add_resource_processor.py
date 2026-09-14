@@ -3,7 +3,6 @@
 """Durable add-resource queue consumer."""
 
 import asyncio
-import concurrent.futures
 import json
 from contextlib import suppress
 from copy import deepcopy
@@ -12,6 +11,7 @@ from typing import Any, Dict, Optional
 from openviking.observability.context import bind_execution_context
 from openviking.server.identity import RequestContext, Role
 from openviking.service.task_tracker import TaskStatus, get_task_tracker
+from openviking.service.task_tracker_concurrency import OwnerLoopDispatcher
 from openviking.service.task_work_index import bind_task_context, extract_task_metadata
 from openviking.storage.queuefs.add_resource_msg import AddResourceMsg
 from openviking.storage.queuefs.named_queue import DequeueHandlerBase
@@ -42,7 +42,9 @@ class AddResourceProcessor(DequeueHandlerBase):
         viking_fs: Any,
     ):
         self._resource_service = resource_service
-        self._service_loop = service_loop
+        self._dispatcher = OwnerLoopDispatcher()
+        if self._dispatcher.bind_current_loop() is not service_loop:
+            raise ValueError("Queue processor must be created on the service event loop")
         self._queue_name = queue_name
         self._viking_fs = viking_fs
 
@@ -347,8 +349,8 @@ class AddResourceProcessor(DequeueHandlerBase):
         except (json.JSONDecodeError, TypeError, ValueError) as exc:
             self.report_error(str(exc), data)
             return None
-        future = asyncio.run_coroutine_threadsafe(
-            self._handle_cancelled(
+        await self._dispatcher.run(
+            lambda: self._handle_cancelled(
                 msg,
                 RequestContext(
                     user=UserIdentifier(msg.account_id, msg.user_id),
@@ -358,9 +360,7 @@ class AddResourceProcessor(DequeueHandlerBase):
                     bypass_acl=msg.bypass_acl,
                 ),
             ),
-            self._service_loop,
         )
-        await asyncio.wrap_future(future)
         unregister_telemetry(msg.telemetry_id or "")
         self.report_success()
         return None
@@ -379,13 +379,5 @@ class AddResourceProcessor(DequeueHandlerBase):
             self.report_error(str(exc), data)
             return None
 
-        future: concurrent.futures.Future[None] = asyncio.run_coroutine_threadsafe(
-            self._process(msg, data),
-            self._service_loop,
-        )
-        try:
-            await asyncio.wrap_future(future)
-        except asyncio.CancelledError:
-            future.cancel()
-            raise
+        await self._dispatcher.run(lambda: self._process(msg, data))
         return None

@@ -28,12 +28,12 @@ from openviking.server.user_config import (
     user_config_backup_uri,
 )
 from openviking.service.core import OpenVikingService
+from openviking.service.deletion import setup_deletion
 from openviking.service.task_store import (
     SYSTEM_TASK_ACCOUNT_ID,
     SYSTEM_TASK_USER_ID,
 )
 from openviking.service.task_tracker import get_task_tracker
-from openviking.service.user_deletion import setup_user_deletion
 from openviking_cli.exceptions import OpenVikingError, PermissionDeniedError
 from openviking_cli.session.user_id import UserIdentifier
 
@@ -173,13 +173,9 @@ async def lightweight_admin_client(lightweight_admin_app):
 
 
 @pytest_asyncio.fixture(scope="function")
-async def admin_service(temp_dir):
-    svc = OpenVikingService(
-        path=str(temp_dir / "admin_data"), user=UserIdentifier.the_default_user("admin_user")
-    )
-    await svc.initialize()
-    yield svc
-    await svc.close()
+async def admin_service(service):
+    """Use the shared service fixture with local fake models."""
+    yield service
 
 
 @pytest_asyncio.fixture(scope="function")
@@ -194,7 +190,7 @@ async def admin_app(admin_service):
     manager = APIKeyManager(root_key=ROOT_KEY, viking_fs=admin_service.viking_fs)
     await manager.load()
     app.state.api_key_manager = manager
-    app.state.user_deletion_service = await setup_user_deletion(
+    app.state.deletion_service = await setup_deletion(
         service=admin_service,
         manager=manager,
     )
@@ -558,26 +554,158 @@ async def test_identity_settings_refreshes_a_stale_registry_on_demand(
     assert user_settings.status_code == 200, user_settings.text
 
 
-async def test_delete_account(admin_client: httpx.AsyncClient):
-    """ROOT can delete an account."""
+async def test_delete_account(admin_client, admin_service, admin_app, monkeypatch):
+    """Account cleanup is tracked, retryable, tenant-scoped, and exhausts large vector sets."""
+    from itertools import islice
+    from types import SimpleNamespace
+
+    from openviking.storage.expr import Eq
+    from openviking.storage.queuefs.queue_manager import QueueManager
+    from openviking.storage.vectordb_adapters.local_adapter import LocalCollectionAdapter
+    from openviking.storage.viking_vector_index_backend import _SingleAccountBackend
+
     acct = _uid()
     resp = await admin_client.post(
         "/api/v1/admin/accounts",
         json={"account_id": acct, "admin_user_id": "alice"},
         headers=root_headers(),
     )
-    user_key = resp.json()["result"]["user_key"]
+    key = resp.json()["result"]["user_key"]
+    path = f"/local/{acct}/resources/project/nested/file.md"
+    await _agfs_write(admin_service, path, "project data")
+    await _agfs_write(admin_service, "/local/other/resources/keep.md", "keep")
+    old_task = await get_task_tracker().create(
+        "session_commit", account_id=acct, user_id="alice", resource_id="old-session"
+    )
+    user_cleanup = await get_task_tracker().create(
+        "user_delete", account_id=acct, user_id="alice", resource_id=f"{acct}/bob"
+    )
+
+    manager = admin_app.state.api_key_manager
+
+    # Exercise the real filter-deletion loop with bounded in-memory I/O.
+    rows = {str(i): {"id": str(i), "account_id": acct} for i in range(100_001)}
+    rows["keep"] = {"id": "keep", "account_id": "other"}
+    adapter = LocalCollectionAdapter("context", "", "default")
+
+    def delete_data(ids):
+        assert 0 < len(ids) <= 100
+        for record_id in ids:
+            rows.pop(record_id, None)
+
+    adapter._collection = SimpleNamespace(delete_data=delete_data)
+    adapter.query = lambda *, filter, limit, **kwargs: list(
+        islice((row for row in rows.values() if row[filter.field] == filter.value), limit)
+    )
+    adapter.get = lambda ids: [rows[record_id] for record_id in ids if record_id in rows]
+    adapter.count = lambda filter: sum(row[filter.field] == filter.value for row in rows.values())
+    vectors = admin_service.viking_fs.vector_store
+    vectors._root_backend = _SingleAccountBackend(
+        vectors._config, bound_account_id=None, shared_adapter=adapter
+    )
+    original_delete = vectors.delete_account_data
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def fail_vectors(account_id, *, ctx):
+        started.set()
+        await release.wait()
+        raise RuntimeError("injected vector failure")
+
+    monkeypatch.setattr(vectors, "delete_account_data", fail_vectors)
 
     resp = await admin_client.delete(f"/api/v1/admin/accounts/{acct}", headers=root_headers())
-    assert resp.status_code == 200
-    assert resp.json()["result"]["deleted"] is True
-
-    # User key should now be invalid
-    resp = await admin_client.get(
-        "/api/v1/fs/ls?uri=viking://",
-        headers={"X-API-Key": user_key},
+    assert resp.status_code == 202
+    result = resp.json()["result"]
+    assert result["status"] == "deleting"
+    task_id = result["task_id"]
+    await asyncio.wait_for(started.wait(), 10)
+    duplicate = await admin_client.delete(f"/api/v1/admin/accounts/{acct}", headers=root_headers())
+    assert duplicate.json()["result"]["task_id"] == task_id
+    denied = await admin_client.get("/api/v1/fs/ls?uri=viking://", headers={"X-API-Key": key})
+    assert denied.status_code == 401
+    conflict = await admin_client.post(
+        "/api/v1/admin/accounts",
+        json={"account_id": acct, "admin_user_id": "new"},
+        headers=root_headers(),
     )
-    assert resp.status_code == 401
+    assert conflict.status_code == 409
+    release.set()
+    failed = await _wait_for_task(admin_client, task_id)
+    assert failed["status"] == "failed"
+    assert "injected vector failure" in failed["error"]
+    assert await _agfs_exists(admin_service, path)
+    await manager.reload()
+    assert manager.get_deletion(acct)["task_id"] == task_id
+
+    retried = await admin_client.delete(f"/api/v1/admin/accounts/{acct}", headers=root_headers())
+    retry_task_id = retried.json()["result"]["task_id"]
+    assert retry_task_id != task_id
+    assert (await _wait_for_task(admin_client, retry_task_id))["status"] == "failed"
+
+    monkeypatch.setattr(vectors, "delete_account_data", original_delete)
+    # Reconcile a durable fence whose previous process stopped before enqueue.
+    retry = await manager.replace_deletion_task(
+        acct,
+        None,
+        expected_task_id=retry_task_id,
+        task_id=str(uuid.uuid4()),
+        owner_account_id=SYSTEM_TASK_ACCOUNT_ID,
+        owner_user_id=SYSTEM_TASK_USER_ID,
+    )
+    await admin_app.state.deletion_service.initialize()
+    completed = await _wait_for_task(admin_client, retry["task_id"])
+    assert completed["status"] == "completed", completed
+    assert completed["result"] == {"deleted": True}
+    assert set(rows) == {"keep"}
+    assert adapter.count(Eq("account_id", acct)) == 0
+    assert not await _agfs_exists(admin_service, f"/local/{acct}")
+    assert await _agfs_exists(admin_service, "/local/other/resources/keep.md")
+    assert manager.get_deletion(acct) is None
+    assert not manager.has_user(acct, "alice")
+    assert await get_task_tracker().get(old_task.task_id, account_id=acct, user_id="alice") is None
+    assert await get_task_tracker().get(user_cleanup.task_id, account_id=acct, user_id="alice") is None
+    assert (await _wait_for_task(admin_client, task_id))["status"] == "failed"
+
+    # Late cleanup deliveries are harmless after deletion, including when the
+    # same account/user IDs have since been recreated.
+    queue = admin_service._queue_manager.get_queue(QueueManager.DATA_CLEANUP)
+    for recreated in (False, True):
+        if recreated:
+            replacement_key = await manager.create_account(acct, "bob")
+            await _agfs_write(admin_service, path, "new data")
+        late_task_id = str(uuid.uuid4())
+        await get_task_tracker().create(
+            "user_delete",
+            task_id=late_task_id,
+            resource_id=f"{acct}/bob",
+            account_id=SYSTEM_TASK_ACCOUNT_ID,
+            user_id=SYSTEM_TASK_USER_ID,
+        )
+        await queue.enqueue(
+            {
+                "task_id": user_cleanup.task_id,
+                "account_id": acct,
+                "user_id": "alice",
+                "target": {"account_id": acct, "user_id": "bob"},
+            }
+        )
+        await queue.enqueue(
+            {
+                "task_id": late_task_id,
+                "account_id": SYSTEM_TASK_ACCOUNT_ID,
+                "user_id": SYSTEM_TASK_USER_ID,
+                "target": {"account_id": acct, "user_id": "bob"},
+            }
+        )
+        skipped = await _wait_for_task(admin_client, late_task_id)
+        assert skipped["status"] == "completed"
+        assert skipped["result"] == {"deleted": not recreated, "stale": True}
+        assert await get_task_tracker().get(
+            user_cleanup.task_id, account_id=acct, user_id="alice"
+        ) is None
+        assert await _agfs_exists(admin_service, path) is recreated
+        if recreated:
+            assert manager.resolve(replacement_key).user_id == "bob"
 
 
 async def test_create_duplicate_account_fails(admin_client: httpx.AsyncClient):

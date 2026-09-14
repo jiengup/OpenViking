@@ -480,17 +480,18 @@ ov --sudo admin list-accounts --limit 50 --page 2
 
 #### 1. API Implementation Overview
 
-Delete a workspace and all associated users and data (ROOT only).
+Asynchronously delete a workspace and all associated users and data (ROOT only). The endpoint returns HTTP `202` and a `task_id` without waiting for data cleanup.
 
 **Processing Flow:**
-1. Verify requester has ROOT privileges
-2. Cascade delete all AGFS data for the account (`user/` and `resources/`; sessions live under `user/`)
-3. Cascade delete all vector DB records for the account
-4. Finally delete account metadata and all user keys
+1. Verify ROOT privileges and persist the account deletion fence, immediately rejecting its keys and ordinary requests; persist a system-owned `account_delete` Task and queued work, then return `status=deleting` and `task_id`
+2. Stop account watches and business tasks, then remove vectors, OAuth grants, usage/audit data, and the entire account AGFS directory, including account-owned task records
+3. Remove the account registry entry and complete the Task only after cleanup succeeds
+
+Account and user cleanup share one queue with a single consumer. Account tasks clean the entire account directly. Later user cleanup tasks complete without further cleanup if their target was deleted. Old tasks also skip accounts or users recreated with the same IDs. Account-owned task records are deleted with the account and are not recreated by late deliveries; system-owned cleanup Tasks remain queryable.
 
 **Code Entry Points:**
 - `openviking/server/routers/admin.py:delete_account` - HTTP route
-- `openviking/server/api_keys/new.py:APIKeyManager.delete_account` - Core implementation
+- `openviking/service/deletion.py:DeletionService.delete` - Core implementation
 - `openviking_cli/client/sync_http.py:SyncHTTPClient.admin_delete_account` - Python SDK
 
 #### 2. Interface and Parameters
@@ -503,7 +504,12 @@ Delete a workspace and all associated users and data (ROOT only).
 
 **Notes:**
 - Delete operation is irreversible and cascades to all account data
-- If some data fails to delete, warnings are logged and deletion continues
+- Cleanup failure marks the Task as `failed` and records the error; the account remains `deleting`
+- Repeated requests during cleanup return the same Task; requesting deletion after failure creates a retry Task for remaining data
+- Unfinished work is recovered on restart; the account cannot be recreated or re-enabled during cleanup
+- Vectors are scanned, deleted, and checked until none remain, with at most 100 records per delete request and no former 100,000-record total ceiling
+- Account listings expose `status=active|deleting` and the cleanup `task_id` when deleting
+- Query `GET /api/v1/tasks/{task_id}` as ROOT for status and errors; cleanup uses only `pending`, `running`, `completed`, and `failed`, without separate cleanup stages. Only `completed` confirms cleanup finished
 
 #### 3. Usage Examples
 
@@ -527,7 +533,7 @@ client = ov.SyncHTTPClient(api_key="<root-key>")
 client.initialize()
 
 result = client.admin_delete_account(account_id="acme")
-print(f"Account deleted: {result['deleted']}")
+print(f"Cleanup task: {result['task_id']}")
 ```
 
 **TypeScript SDK**
@@ -543,7 +549,7 @@ result, err := client.AdminDeleteAccount(ctx, "acme")
 if err != nil {
     return err
 }
-fmt.Println(result["deleted"])
+fmt.Println(result["task_id"])
 ```
 
 **CLI**
@@ -551,6 +557,7 @@ fmt.Println(result["deleted"])
 ```bash
 # Requires ROOT privileges, use --sudo
 ov --sudo admin delete-account acme
+ov --sudo task status <task_id>
 ```
 
 **Response Example**
@@ -559,7 +566,9 @@ ov --sudo admin delete-account acme
 {
   "status": "ok",
   "result": {
-    "deleted": true
+    "account_id": "acme",
+    "status": "deleting",
+    "task_id": "550e8400-e29b-41d4-a716-446655440000"
   },
   "time": 0.1
 }
@@ -835,7 +844,7 @@ Remove a user from a workspace. The user's API key is revoked immediately, and o
 
 **Code Entry Points:**
 - `openviking/server/routers/admin.py:remove_user` - HTTP route
-- `openviking/service/user_deletion.py:UserDeletionService.delete_user` - Core implementation
+- `openviking/service/deletion.py:DeletionService.delete` - Core implementation
 - `openviking_cli/client/sync_http.py:SyncHTTPClient.admin_remove_user` - Python SDK
 
 #### 2. Interface and Parameters
