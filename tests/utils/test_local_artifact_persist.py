@@ -51,11 +51,27 @@ class _RecordingAgfs:
 
 @pytest.mark.asyncio
 async def test_persist_local_artifact_uploads_to_resource_tree(tmp_path, monkeypatch):
+    import json
+
+    from openviking.parse.parsers.upload_utils import ARTIFACT_MANIFEST_NAME
+    from openviking.utils.content_hash import content_md5
+
     # A local artifact laid out as <root>/repository/<files>, as code.parse writes.
     store = LocalParseOutputStore(local_root=str(tmp_path / "artifacts"))
     ref = await store.create_artifact(root_type="dir")
     await store.write_bytes(ref, "repository/a.py", b"print('a')")
     await store.write_bytes(ref, "repository/src/b.py", b"print('b')")
+    # The manifest sidecar is the md5 source of truth (written by upload_directory).
+    await store.write_bytes(
+        ref,
+        ARTIFACT_MANIFEST_NAME,
+        json.dumps(
+            {
+                "repository/a.py": content_md5(b"print('a')"),
+                "repository/src/b.py": content_md5(b"print('b')"),
+            }
+        ).encode("utf-8"),
+    )
 
     agfs = _RecordingAgfs()
     monkeypatch.setattr("openviking.utils.resource_processor.get_viking_fs", lambda: agfs)

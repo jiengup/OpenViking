@@ -3,6 +3,7 @@
 """Tests for full-artifact upload (initial import = the plan is all added)."""
 
 import asyncio
+import json
 
 import pytest
 
@@ -52,13 +53,19 @@ class _FakeTarget:
 @pytest.mark.asyncio
 async def test_full_upload_uploads_all_files_under_doc_root() -> None:
     # Artifact root holds repository/<files>; only files under repository are
-    # uploaded, and they land target-relative (repository prefix stripped).
+    # uploaded, and they land target-relative (repository prefix stripped). md5
+    # comes from the artifact manifest sidecar (source of truth), not re-hashed.
     ref = ParseArtifactRef(backend="local", root="/tmp/art", root_type="dir")
+    manifest = {
+        "repository/a.py": content_md5(b"aaa"),
+        "repository/src/b.py": content_md5(b"bbb"),
+    }
     store = _FakeStore(
         {
             "/tmp/art/repository/a.py": b"aaa",
             "/tmp/art/repository/src/b.py": b"bbb",
             "/tmp/art/repository/.image_mappings.json": b"{}",
+            "/tmp/art/.artifact_manifest.json": json.dumps(manifest).encode("utf-8"),
         }
     )
     target = _FakeTarget()
@@ -82,6 +89,8 @@ async def test_full_upload_runs_writes_concurrently() -> None:
     # one-await-at-a-time: with N files gated by a barrier that only releases once
     # every write has started, a serial implementation would deadlock.
     files = {f"/tmp/art/repository/f{i}.py": f"c{i}".encode() for i in range(5)}
+    manifest = {f"repository/f{i}.py": content_md5(f"c{i}".encode()) for i in range(5)}
+    files["/tmp/art/.artifact_manifest.json"] = json.dumps(manifest).encode("utf-8")
     ref = ParseArtifactRef(backend="local", root="/tmp/art", root_type="dir")
     store = _FakeStore(files)
 
@@ -94,7 +103,7 @@ async def test_full_upload_runs_writes_concurrently() -> None:
             nonlocal inflight, peak
             inflight += 1
             peak = max(peak, inflight)
-            if inflight >= len(files):
+            if inflight >= 5:
                 started.set()
             await asyncio.wait_for(started.wait(), timeout=5)
             inflight -= 1
@@ -108,7 +117,7 @@ async def test_full_upload_runs_writes_concurrently() -> None:
         target=target,
     )
 
-    assert peak == len(files)
-    assert len(result.uploaded) == len(files)
+    assert peak == 5
+    assert len(result.uploaded) == 5
     for i in range(5):
         assert result.md5_by_rel[f"f{i}.py"] == content_md5(f"c{i}".encode())

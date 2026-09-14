@@ -73,7 +73,13 @@ class TestApplyDiffPlan:
         assert result.uploaded == []
 
     async def test_added_and_modified_upload_with_md5(self) -> None:
-        plan = DiffPlan(added=["a.py"], modified=["b.py"])
+        # md5 is the source-of-truth manifest fingerprint carried on the plan
+        # (computed at the parse-upload site), not re-hashed here.
+        plan = DiffPlan(
+            added=["a.py"],
+            modified=["b.py"],
+            new_md5s={"a.py": content_md5(b"aaa"), "b.py": content_md5(b"bbb")},
+        )
         store = _FakeStore({"a.py": b"aaa", "b.py": b"bbb"})
         target = _FakeTarget(existing={"b.py": b"old"})
 
@@ -83,7 +89,7 @@ class TestApplyDiffPlan:
         assert set(result.uploaded) == {"a.py", "b.py"}
         assert result.added == ["a.py"]
         assert result.modified == ["b.py"]
-        # md5 is computed from the uploaded bytes so it can feed embedding.
+        # md5 comes from the plan manifest so it can feed embedding.
         assert result.md5_by_rel["a.py"] == content_md5(b"aaa")
         assert result.md5_by_rel["b.py"] == content_md5(b"bbb")
 
@@ -159,7 +165,10 @@ class TestApplyDiffPlan:
         assert target.written == {}
 
     async def test_needs_body_compare_different_uploads(self) -> None:
-        plan = DiffPlan(needs_body_compare=["a.py"])
+        plan = DiffPlan(
+            needs_body_compare=["a.py"],
+            new_md5s={"a.py": content_md5(b"new")},
+        )
         store = _FakeStore({"a.py": b"new"})
         target = _FakeTarget(existing={"a.py": b"old"})
 
@@ -168,10 +177,11 @@ class TestApplyDiffPlan:
         assert result.uploaded == ["a.py"]
         assert result.modified == ["a.py"]
         assert target.written == {"a.py": b"new"}
+        # md5 comes from the plan manifest for the resolved body-compare upload.
         assert result.md5_by_rel["a.py"] == content_md5(b"new")
 
     async def test_repair_with_different_body_uploads_and_keeps_repair_state(self) -> None:
-        plan = DiffPlan(repair=["a.py"])
+        plan = DiffPlan(repair=["a.py"], new_md5s={"a.py": content_md5(b"new")})
         target = _FakeTarget(existing={"a.py": b"old"})
 
         result = await apply_diff_plan(
@@ -183,6 +193,7 @@ class TestApplyDiffPlan:
 
         assert target.written == {"a.py": b"new"}
         assert result.repair == ["a.py"]
+        # md5 comes from the plan manifest for the re-uploaded repair file.
         assert result.md5_by_rel["a.py"] == content_md5(b"new")
 
     async def test_repair_with_same_body_skips_upload_but_keeps_repair_state(self) -> None:
@@ -230,7 +241,10 @@ class TestApplyDiffPlan:
         # that only releases once every write is inflight would deadlock a serial
         # loop.
         files = {f"f{i}.py": f"c{i}".encode() for i in range(6)}
-        plan = DiffPlan(added=list(files))
+        plan = DiffPlan(
+            added=list(files),
+            new_md5s={name: content_md5(data) for name, data in files.items()},
+        )
         store = _FakeStore(files)
 
         started = asyncio.Event()
