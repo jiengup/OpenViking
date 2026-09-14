@@ -23,11 +23,15 @@ incomplete snapshot never carries deletions — see build_diff_plan).
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Sequence, Tuple
 
+from openviking.parse.parsers.upload_utils import ARTIFACT_MANIFEST_NAME
 from openviking.storage.viking_fs._diff_plan import CONTROL_BASENAMES, DiffPlan
-from openviking.utils.content_hash import content_md5
+
+logger = logging.getLogger(__name__)
 
 
 def _upload_concurrency() -> int:
@@ -90,7 +94,7 @@ class ApplyResult:
     md5_by_rel: Dict[str, str] = field(default_factory=dict)
 
 
-async def _upload(rel_path: str, *, store, artifact_ref, target) -> str:
+async def _upload(rel_path: str, *, store, artifact_ref, target) -> None:
     """Read one file from the store and write it to the target, returning md5.
 
     Runs as an independent task so callers can fan out uploads concurrently; the
@@ -98,11 +102,7 @@ async def _upload(rel_path: str, *, store, artifact_ref, target) -> str:
     not race on the ``ApplyResult`` collections.
     """
     data = await store.read_bytes(artifact_ref, rel_path)
-    # The target may normalize bytes on write (e.g. encoding). md5 must reflect
-    # the FINAL stored bytes, so hash what write_file reports it stored.
-    written = await target.write_file(rel_path, data)
-    final_bytes = written if written is not None else data
-    return content_md5(final_bytes)
+    await target.write_file(rel_path, data)
 
 
 async def _upload_concurrent(
@@ -125,16 +125,15 @@ async def _upload_concurrent(
         return
     sem = asyncio.Semaphore(concurrency if concurrency is not None else _upload_concurrency())
 
-    async def _one(rel_path: str) -> Tuple[str, str]:
+    async def _one(rel_path: str) -> str:
         async with sem:
             md5 = await _upload(
                 rel_path, store=store, artifact_ref=artifact_ref, target=target
             )
-        return rel_path, md5
+        return rel_path
 
-    for rel_path, md5 in await asyncio.gather(*(_one(rel) for rel in rel_paths)):
+    for rel_path in await asyncio.gather(*(_one(rel) for rel in rel_paths)):
         result.uploaded.append(rel_path)
-        result.md5_by_rel[rel_path] = md5
 
 
 async def apply_diff_plan(
@@ -161,6 +160,10 @@ async def apply_diff_plan(
         md5_by_rel=dict(plan.new_md5s),
         abstracts_by_rel=dict(plan.file_abstracts),
     )
+    body_compare_equal = 0
+    body_compare_modified = 0
+    body_compare_read_failed = 0
+    body_compare_samples: List[str] = []
 
     # Structural replacements: delete the stale node up front. The replacement is
     # written by its added/modified classification below.
@@ -195,16 +198,33 @@ async def apply_diff_plan(
         new_bytes = await store.read_bytes(artifact_ref, rel_path)
         try:
             old_bytes = await target.read_file(rel_path)
-        except Exception:
+        except Exception as exc:
             old_bytes = None
+            body_compare_read_failed += 1
+            if len(body_compare_samples) < 5:
+                body_compare_samples.append(f"{rel_path}(read_failed={exc})")
         if old_bytes is not None and old_bytes == new_bytes:
             result.unchanged.append(rel_path)
+            body_compare_equal += 1
             continue
-        written = await target.write_file(rel_path, new_bytes)
-        final_bytes = written if written is not None else new_bytes
+        await target.write_file(rel_path, new_bytes)
         result.uploaded.append(rel_path)
         result.modified.append(rel_path)
-        result.md5_by_rel[rel_path] = content_md5(final_bytes)
+        result.md5_by_rel[rel_path] = plan.new_md5s.get(rel_path, "")
+        body_compare_modified += 1
+        if len(body_compare_samples) < 5:
+            body_compare_samples.append(f"{rel_path}(content_different)")
+
+    if plan.needs_body_compare:
+        logger.info(
+            "[IncrementalDiff] body_compare total=%d equal=%d modified=%d "
+            "read_failed=%d samples=%s",
+            len(plan.needs_body_compare),
+            body_compare_equal,
+            body_compare_modified,
+            body_compare_read_failed,
+            body_compare_samples,
+        )
 
     for rel_path in plan.repair:
         new_bytes = await store.read_bytes(artifact_ref, rel_path)
@@ -213,12 +233,11 @@ async def apply_diff_plan(
         except Exception:
             old_bytes = None
         if old_bytes is not None and old_bytes == new_bytes:
-            result.md5_by_rel.setdefault(rel_path, content_md5(new_bytes))
+            result.md5_by_rel.setdefault(rel_path, plan.new_md5s.get(rel_path, ""))
             continue
-        written = await target.write_file(rel_path, new_bytes)
-        final_bytes = written if written is not None else new_bytes
+        await target.write_file(rel_path, new_bytes)
         result.uploaded.append(rel_path)
-        result.md5_by_rel[rel_path] = content_md5(final_bytes)
+        result.md5_by_rel[rel_path] = plan.new_md5s.get(rel_path, "")
 
     result.unchanged.extend(plan.unchanged)
 
@@ -262,16 +281,28 @@ async def apply_full_artifact_upload(
     the upload point, exactly like the incremental path.
     """
     result = ApplyResult()
+    manifest_md5s: Dict[str, str] = {}
     base = doc_rel.strip("/")
     prefix = f"{base}/" if base else ""
+    try:
+        raw_manifest = await store.read_bytes(artifact_ref, ARTIFACT_MANIFEST_NAME)
+        loaded_manifest = json.loads(raw_manifest.decode("utf-8"))
+        if isinstance(loaded_manifest, dict):
+            manifest_md5s = {
+                (key[len(prefix) :] if prefix and key.startswith(prefix) else key): str(value)
+                for key, value in loaded_manifest.items()
+            }
+    except Exception:
+        logger.info(
+            "[IncrementalDiff] artifact manifest unavailable during full upload; vector md5 remains empty"
+        )
     if root_is_file:
         data = await store.read_bytes(artifact_ref, base)
         written = await target.write_file("", data)
-        final_bytes = written if written is not None else data
         result.uploaded.append("")
         result.added.append("")
         result.files.append("")
-        result.md5_by_rel[""] = content_md5(final_bytes)
+        result.md5_by_rel[""] = manifest_md5s.get("", "")
         return result
 
     directories: set[str] = set()
@@ -303,6 +334,9 @@ async def apply_full_artifact_upload(
         result=result,
     )
     result.files.extend(upload_targets)
+    result.md5_by_rel.update(
+        {rel_path: manifest_md5s[rel_path] for rel_path in upload_targets if rel_path in manifest_md5s}
+    )
     for rel_path in sorted(directories, key=lambda value: (value.count("/"), value)):
         await target.mkdir(rel_path)
         result.added_dirs.append(rel_path)

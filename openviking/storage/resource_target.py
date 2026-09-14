@@ -16,7 +16,6 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from openviking.parse.parsers.upload_utils import detect_and_convert_encoding
 from openviking.utils.path_safety import safe_join_viking_uri
 
 
@@ -44,18 +43,12 @@ class AgfsResourceTarget:
         return self._root_uri if not rel_path else safe_join_viking_uri(self._root_uri, rel_path)
 
     async def write_file(self, rel_path: str, data: bytes) -> bytes:
-        """Write ``data`` under the resource root, returning final stored bytes.
-
-        Encoding normalization mirrors the directory upload path so the bytes
-        that land in AGFS are identical regardless of artifact backend; the apply
-        executor hashes the returned bytes so md5 tracks the final content.
-        """
-        final_bytes = detect_and_convert_encoding(data, rel_path)
+        """Write artifact bytes normalized before manifest generation."""
         uri = self._resolve(rel_path)
         await self._viking_fs.write_file_bytes(
-            uri, final_bytes, ctx=self._ctx, lease_ref=self._lease_ref
+            uri, data, ctx=self._ctx, lease_ref=self._lease_ref
         )
-        return final_bytes
+        return data
 
     async def mkdir(self, rel_path: str) -> None:
         await self._viking_fs.mkdir(

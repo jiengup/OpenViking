@@ -20,6 +20,7 @@ Assembling the plan then delegates to :func:`build_diff_plan`.
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
 from typing import Any, Dict, Tuple
 
@@ -34,6 +35,8 @@ from openviking.storage.viking_fs._diff_plan import (
     build_diff_plan,
 )
 from openviking_cli.utils import VikingURI
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -215,13 +218,22 @@ async def build_resource_diff_plan(
         ctx=ctx,
         root_is_file=root_is_file,
     )
-    return build_diff_plan(
+    plan = build_diff_plan(
         new=new,
         target_files=target_files,
         target_vectors=target_vectors,
         target_files_complete=files_complete,
         target_vectors_complete=True,
     )
+    _log_diff_diagnostics(
+        target_uri=target_uri,
+        new=new,
+        target_files=target_files,
+        target_vectors=target_vectors,
+        plan=plan,
+        target_files_complete=files_complete,
+    )
+    return plan
 
 
 async def build_resource_diff_snapshot(
@@ -261,12 +273,97 @@ async def build_resource_diff_snapshot(
         target_files_complete=files_complete,
         target_vectors_complete=True,
     )
+    _log_diff_diagnostics(
+        target_uri=target_uri,
+        new=new,
+        target_files=target_files,
+        target_vectors=target_vectors,
+        plan=plan,
+        target_files_complete=files_complete,
+    )
     return ResourceDiffSnapshot(
         new=new,
         target_files=target_files,
         vector_inventory=inventory,
         plan=plan,
     )
+
+
+def _log_diff_diagnostics(
+    *,
+    target_uri: str,
+    new: Dict[str, NewEntry],
+    target_files: Dict[str, TargetFile],
+    target_vectors: Dict[str, TargetVector],
+    plan: DiffPlan,
+    target_files_complete: bool,
+) -> None:
+    """Log the MD5 decision buckets behind an incremental diff."""
+    md5_equal = 0
+    md5_mismatch = 0
+    md5_missing = 0
+    vector_missing = 0
+    mismatch_samples: list[str] = []
+    missing_md5_samples: list[str] = []
+
+    for rel_path, new_entry in new.items():
+        if new_entry.is_dir or rel_path not in target_files:
+            continue
+        target_vector = target_vectors.get(rel_path)
+        if target_vector is None:
+            vector_missing += 1
+            continue
+        if new_entry.md5 and target_vector.md5:
+            if new_entry.md5 == target_vector.md5:
+                md5_equal += 1
+            else:
+                md5_mismatch += 1
+                if len(mismatch_samples) < 5:
+                    mismatch_samples.append(
+                        f"{rel_path}(source={new_entry.md5},target={target_vector.md5})"
+                    )
+        else:
+            md5_missing += 1
+            if len(missing_md5_samples) < 5:
+                missing_md5_samples.append(
+                    f"{rel_path}(source={bool(new_entry.md5)},target={bool(target_vector.md5)})"
+                )
+
+    logger.info(
+        "[IncrementalDiff] target=%s N_files=%d F_files=%d V_vectors=%d "
+        "plan_added=%d plan_modified=%d plan_unchanged=%d plan_repair=%d "
+        "plan_needs_body_compare=%d plan_deleted=%d plan_orphan_vectors=%d "
+        "md5_equal=%d md5_mismatch=%d md5_missing=%d vector_missing=%d "
+        "target_files_complete=%s",
+        target_uri,
+        sum(1 for entry in new.values() if not entry.is_dir),
+        sum(1 for entry in target_files.values() if not entry.is_dir),
+        len(target_vectors),
+        len(plan.added),
+        len(plan.modified),
+        len(plan.unchanged),
+        len(plan.repair),
+        len(plan.needs_body_compare),
+        len(plan.deleted),
+        len(plan.orphan_vectors),
+        md5_equal,
+        md5_mismatch,
+        md5_missing,
+        vector_missing,
+        target_files_complete,
+    )
+    if mismatch_samples:
+        logger.info(
+            "[IncrementalDiff] md5_mismatch_samples target=%s samples=%s",
+            target_uri,
+            mismatch_samples,
+        )
+    if missing_md5_samples:
+        logger.info(
+            "[IncrementalDiff] md5_missing_samples target=%s samples=%s",
+            target_uri,
+            missing_md5_samples,
+        )
 
 
 __all__ = [
