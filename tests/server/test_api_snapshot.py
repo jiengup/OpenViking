@@ -149,6 +149,51 @@ async def test_log_accepts_32_raw_path_parameters(snapshot_router_client, monkey
     assert len(forwarded_paths) == 32
 
 
+async def test_commit_forwards_file_paths_separately(snapshot_router_client, monkeypatch):
+    from openviking.server.routers import snapshot
+
+    commit_mock = AsyncMock(return_value={"result": "noop", "commit_oid": "a" * 40, "ignored": 0})
+    monkeypatch.setattr(
+        snapshot,
+        "get_service",
+        lambda: SimpleNamespace(fs=SimpleNamespace(commit=commit_mock)),
+    )
+
+    response = await snapshot_router_client.post(
+        "/api/v1/snapshot/commit",
+        json={
+            "message": "record deletion",
+            "paths": ["viking://resources/docs/"],
+            "file_paths": ["viking://resources/docs/a.md"],
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    kwargs = commit_mock.await_args.kwargs
+    assert kwargs["paths"] == ["viking://resources/docs"]
+    assert kwargs["file_paths"] == ["viking://resources/docs/a.md"]
+
+
+async def test_commit_rejects_invalid_file_path_uri(snapshot_router_client, monkeypatch):
+    from openviking.server.routers import snapshot
+
+    commit_mock = AsyncMock()
+    monkeypatch.setattr(
+        snapshot,
+        "get_service",
+        lambda: SimpleNamespace(fs=SimpleNamespace(commit=commit_mock)),
+    )
+
+    response = await snapshot_router_client.post(
+        "/api/v1/snapshot/commit",
+        json={"message": "bad", "file_paths": ["not-a-viking-uri"]},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "INVALID_URI"
+    commit_mock.assert_not_awaited()
+
+
 async def test_log_scan_limit_error_maps_to_invalid_argument(monkeypatch):
     from openviking.pyagfs.exceptions import AGFSInvalidOperationError
     from openviking.server.routers import snapshot

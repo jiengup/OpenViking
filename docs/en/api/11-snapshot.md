@@ -59,6 +59,7 @@ Save the current workspace state as a new snapshot.
 |-----------|------|----------|---------|-------------|
 | message | str | Yes | - | Commit message |
 | paths | List[str] | No | null | `viking://` URIs to scope the snapshot to; entries may be files or directories. Directories are expanded recursively with the snapshot pruning rules applied. USER/ADMIN callers must provide this field; `null` account-wide snapshots are reserved for local ROOT mode. An empty list `[]` is forwarded as an explicit empty path set (no-op). A path that exists in neither the VFS nor the previous snapshot logs a warning and is treated as a no-op deletion |
+| file_paths | List[str] | No | null | `viking://` URIs the caller declares to be files. Each entry is locked and read as one file: an existing file is snapshotted, a deleted one records only that file's deletion (a same-name subtree in the previous snapshot is left alone), and a directory is rejected with `FAILED_PRECONDITION`. Use it when the caller knows the target is a file, e.g. to record a deletion after `rm`. May be combined with `paths`; USER/ADMIN callers must provide at least one of the two |
 | branch | str | No | `main` | Branch to advance |
 | author_name | str | No | null | Override the default author name (default `viking-bot`) |
 | author_email | str | No | null | Override the default author email |

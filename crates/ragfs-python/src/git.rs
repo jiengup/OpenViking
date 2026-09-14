@@ -444,6 +444,7 @@ pub fn parse_commit_request(kwargs: &Bound<PyDict>) -> PyResult<CommitRequest> {
         branch: require_str(kwargs, "branch")?,
         message: require_str(kwargs, "message")?,
         paths: optional_string_list(kwargs, "paths")?,
+        file_paths: optional_string_list(kwargs, "file_paths")?,
         author_name: require_str(kwargs, "author_name")?,
         author_email: require_str(kwargs, "author_email")?,
     })
@@ -1215,6 +1216,7 @@ mod tests {
             branch: "main".into(),
             message: "m".into(),
             paths: None,
+            file_paths: None,
             author_name: "n".into(),
             author_email: "e".into(),
         };
@@ -1230,6 +1232,7 @@ mod tests {
             branch: "main".into(),
             message: "m".into(),
             paths: None,
+            file_paths: None,
             author_name: "n".into(),
             author_email: "e".into(),
         };

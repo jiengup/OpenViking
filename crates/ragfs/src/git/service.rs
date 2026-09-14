@@ -129,10 +129,8 @@ impl GitService {
     /// index can never produce an incorrect commit.
     pub async fn commit(&self, req: CommitRequest) -> Result<CommitResponse, GitError> {
         validate_account_id(&req.account)?;
-        if let Some(paths) = &req.paths {
-            for path in paths {
-                validate_relative_path(path)?;
-            }
+        for path in req.paths.iter().flatten().chain(req.file_paths.iter().flatten()) {
+            validate_relative_path(path)?;
         }
 
         let ctx = Arc::new(FsContextInner::new(req.account.clone()));
@@ -145,6 +143,7 @@ impl GitService {
             branch,
             message,
             paths,
+            file_paths,
             author_name,
             author_email,
         } = req;
@@ -254,14 +253,34 @@ impl GitService {
         // Lazily flatten prev_tree once if any explicit path requires it.
         let mut prev_paths_cache: Option<Vec<(String, ObjectId)>> = None;
 
-        let candidates: Vec<String> = match &paths {
-            Some(ps) => {
+        //      `file_paths` entries carry an explicit file scope: they take
+        //      the File branch verbatim, a NotFound entry only records that
+        //      one file's deletion (no `p/` prefix expansion), and a
+        //      Directory entry is an error rather than a silent widening.
+        let scoped = paths.is_some() || file_paths.is_some();
+        // File-scope names whose prev_tree entry is a *tree* must not be
+        // removed in the main loop: that would drop the same-name subtree.
+        let file_scoped: HashSet<&String> = file_paths
+            .iter()
+            .flatten()
+            .filter(|p| !paths.iter().flatten().any(|legacy| legacy == *p))
+            .collect();
+        let candidates: Vec<String> = match scoped {
+            true => {
                 let mut set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
 
-                for p in ps {
+                let entries = paths
+                    .iter()
+                    .flatten()
+                    .map(|p| (p, false))
+                    .chain(file_paths.iter().flatten().map(|p| (p, true)));
+                for (p, file_scope) in entries {
                     let abs = format!("/local/{}/{}", account, p);
                     match self.vfs.stat(&abs).await {
                         Ok(info) if info.is_dir => {
+                            if file_scope {
+                                return Err(GitError::PathIsDirectory(p.clone()));
+                            }
                             // Directory: recursive listing + prev_tree subtree.
                             cleanup_prefixes.push(format!("{}/", p));
 
@@ -360,16 +379,21 @@ impl GitService {
                             // Neither file nor directory in the VFS. Treat
                             // it as a delete-by-name: feed `p` into the main
                             // loop (where the NotFound branch will remove it
-                            // from the tree if it was a file) AND union in
-                            // every prev_tree path under "p/" so a missing
+                            // from the tree if it was a file) AND, unless the
+                            // caller declared a file scope, union in every
+                            // prev_tree path under "p/" so a missing
                             // directory drops its whole subtree.
-                            warn!(
-                                "commit path {:?} not found in VFS; \
-                                 treating as deletion of any matching subtree",
-                                p
-                            );
+                            if file_scope {
+                                warn!("commit file path {:?} not found in VFS; recording deletion", p);
+                            } else {
+                                warn!(
+                                    "commit path {:?} not found in VFS; \
+                                     treating as deletion of any matching subtree",
+                                    p
+                                );
+                                cleanup_prefixes.push(format!("{}/", p));
+                            }
                             cleanup_exact.insert(p.clone());
-                            cleanup_prefixes.push(format!("{}/", p));
 
                             if include_path(p) {
                                 set.insert(p.clone());
@@ -404,6 +428,9 @@ impl GitService {
                                         .await?;
                                     changed += 1;
                                 }
+                            }
+                            if file_scope {
+                                continue;
                             }
                             if let Some(t) = prev_tree {
                                 if prev_paths_cache.is_none() {
@@ -458,7 +485,7 @@ impl GitService {
             // the `NotFound → remove` branch below and is dropped from the new
             // snapshot. Deduped via BTreeSet so a path present in both sources
             // is only processed once.
-            None => {
+            false => {
                 let listed = crate::git::enumerate::collect_all(&self.vfs, &account).await?;
                 let mut set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
                 for p in listed {
@@ -502,16 +529,15 @@ impl GitService {
         //     For full enumeration (paths=None), start empty: only paths seen
         //     this commit end up in the new index.
         let mut new_index_entries: HashMap<String, IndexEntry> =
-            match (self.index_store.is_some(), &paths, &prev_index) {
-                (true, Some(_), Some(idx)) => idx.entries.clone(),
-                (true, _, _) => HashMap::new(),
+            match (self.index_store.is_some(), scoped, &prev_index) {
+                (true, true, Some(idx)) => idx.entries.clone(),
                 _ => HashMap::new(),
             };
         // For partial commits we still need to drop entries for any explicitly
         // listed path before we re-fill it — otherwise a deleted path that
         // was in the old index would linger. Directory entries clean by
         // prefix; file/NotFound entries clean by exact key.
-        if paths.is_some() {
+        if scoped {
             for key in &cleanup_exact {
                 new_index_entries.remove(key);
             }
@@ -653,7 +679,12 @@ impl GitService {
                         }
                         None => None,
                     };
-                    if prev_entry.is_some() {
+                    let removable = match prev_entry {
+                        Some((_, mode)) if mode.is_tree() => !file_scoped.contains(&rel_path),
+                        Some(_) => true,
+                        None => false,
+                    };
+                    if removable {
                         editor
                             .remove(self.object_store.as_ref(), &account, &rel_path)
                             .await?;
@@ -2055,6 +2086,7 @@ mod tests {
             branch: branch.to_string(),
             message: message.to_string(),
             paths,
+            file_paths: None,
             author_name: "tester".to_string(),
             author_email: "tester@example.com".to_string(),
         }
@@ -2743,6 +2775,109 @@ mod tests {
             .await,
             Ok(ShowResponse::Blob { .. })
         ));
+    }
+
+    /// `file_paths` declares a file scope. A missing entry records only that
+    /// file's deletion: a tracked subtree of the same name must survive,
+    /// unlike the legacy `paths` NotFound branch which drops `p/`.
+    /// Uses MockVfs, whose `stat` reports directories as NotFound.
+    #[tokio::test]
+    async fn test_commit_file_paths_missing_file_does_not_expand_subtree() {
+        let (_dir, vfs, _object_store, _ref_store, svc) = make_service("acct");
+        vfs.put("docs/a/x.md", b"XX");
+        let first = make_commit(&svc, "acct", "main", "first").await;
+
+        let file_req = |message: &str| CommitRequest {
+            account: "acct".into(),
+            branch: "main".into(),
+            message: message.into(),
+            paths: None,
+            file_paths: Some(vec!["docs/a".into()]),
+            author_name: "t".into(),
+            author_email: "t@x".into(),
+        };
+        let resp = svc.commit(file_req("missing file")).await.unwrap();
+        assert!(
+            matches!(resp, CommitResponse::Noop { commit_oid, .. } if commit_oid == first),
+            "file scope must not drop docs/a/ from the snapshot: {resp:?}"
+        );
+        assert!(matches!(
+            svc.show(ShowRequest {
+                account: "acct".into(),
+                target_ref: first.to_hex().to_string(),
+                path: Some("docs/a/x.md".into()),
+            })
+            .await,
+            Ok(ShowResponse::Blob { .. })
+        ));
+
+        // Legacy `paths` keeps its subtree semantics for the same input.
+        let resp = svc
+            .commit(req("acct", "main", "legacy", Some(vec!["docs/a".into()])))
+            .await
+            .unwrap();
+        assert!(matches!(resp, CommitResponse::Created { changed: 1, .. }));
+    }
+
+    /// A `file_paths` entry that is a directory on disk is rejected instead
+    /// of being silently widened to the subtree. Uses `LocalFileSystem`
+    /// because `MockVfs::stat` never reports `is_dir`.
+    #[tokio::test]
+    async fn test_commit_file_paths_rejects_directory() {
+        use crate::plugins::localfs::LocalFileSystem;
+
+        let store_dir = tempfile::tempdir().unwrap();
+        let object_store = Arc::new(LocalObjectStore::new(store_dir.path()));
+        let ref_store = Arc::new(LocalRefStore::new(store_dir.path()));
+        let work_dir = tempfile::tempdir().unwrap();
+        let acct_root = work_dir.path().join("local").join("acct");
+        std::fs::create_dir_all(acct_root.join("docs")).unwrap();
+        std::fs::write(acct_root.join("docs/a.md"), b"AA").unwrap();
+        let vfs: Arc<dyn FileSystem> =
+            Arc::new(LocalFileSystem::new(work_dir.path().to_str().unwrap()).unwrap());
+        let svc = GitService::new(vfs, object_store.clone(), ref_store);
+
+        let err = svc
+            .commit(CommitRequest {
+                account: "acct".into(),
+                branch: "main".into(),
+                message: "dir as file".into(),
+                paths: None,
+                file_paths: Some(vec!["docs".into()]),
+                author_name: "t".into(),
+                author_email: "t@x".into(),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, GitError::PathIsDirectory(p) if p == "docs"));
+        assert!(
+            matches!(
+                svc.log(LogRequest {
+                    account: "acct".into(),
+                    branch: "main".into(),
+                    limit: 1,
+                    paths: None,
+                })
+                .await,
+                Err(GitError::RefStore(RefStoreError::NotFound(_)))
+            ),
+            "rejected commit must not advance the branch"
+        );
+
+        // The same file listed under `file_paths` commits normally.
+        let resp = svc
+            .commit(CommitRequest {
+                account: "acct".into(),
+                branch: "main".into(),
+                message: "file".into(),
+                paths: None,
+                file_paths: Some(vec!["docs/a.md".into()]),
+                author_name: "t".into(),
+                author_email: "t@x".into(),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(resp, CommitResponse::Created { changed: 1, .. }));
     }
 
     /// Pruning applies to explicit directories: passing `_system` results
@@ -6199,6 +6334,7 @@ mod fast_path1_tests {
             branch: branch.to_string(),
             message: "m".to_string(),
             paths,
+            file_paths: None,
             author_name: "tester".to_string(),
             author_email: "t@x".to_string(),
         }
@@ -6499,6 +6635,7 @@ mod fast_path1_tests {
             branch: "main".into(),
             message: "m".into(),
             paths: None,
+            file_paths: None,
             author_name: "tester".into(),
             author_email: "t@x".into(),
         };
@@ -6515,6 +6652,7 @@ mod fast_path1_tests {
             branch: "main".into(),
             message: "m".into(),
             paths: Some(vec!["docs".into()]),
+            file_paths: None,
             author_name: "tester".into(),
             author_email: "t@x".into(),
         };

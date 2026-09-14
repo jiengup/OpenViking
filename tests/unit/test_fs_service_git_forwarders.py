@@ -60,6 +60,7 @@ async def test_commit_forwards_all_kwargs(svc, viking_fs_mock):
     viking_fs_mock.commit.assert_awaited_once_with(
         message="snapshot",
         paths=["viking://resources/a.md"],
+        file_paths=None,
         branch="main",
         author_name="me",
         author_email="me@x",
@@ -74,6 +75,7 @@ async def test_commit_defaults_paths_to_none(svc, viking_fs_mock):
     await svc.commit(message="m", ctx=ctx)
     kwargs = viking_fs_mock.commit.await_args.kwargs
     assert kwargs["paths"] is None
+    assert kwargs["file_paths"] is None
     assert kwargs["branch"] == "main"
     assert kwargs["author_name"] is None
     assert kwargs["author_email"] is None

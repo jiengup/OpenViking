@@ -1606,6 +1606,24 @@ def test_visible_experience_snapshot_uris_only_returns_applied_body_changes():
 
 
 @pytest.mark.asyncio
+async def test_commit_experience_snapshot_declares_file_scope():
+    """Experience URIs are files; deleted ones must not be locked as trees (#4966)."""
+    viking_fs = SimpleNamespace(commit=AsyncMock())
+    deleted_uri = "viking://user/u/memories/experiences/example.md"
+
+    await _commit_experience_snapshot(
+        viking_fs,
+        ctx=_ctx(),
+        experience_uris=[deleted_uri, deleted_uri],
+        archive_uri="viking://user/u/sessions/session-1/history/archive_001",
+    )
+
+    kwargs = viking_fs.commit.await_args.kwargs
+    assert kwargs["file_paths"] == [deleted_uri]
+    assert "paths" not in kwargs
+
+
+@pytest.mark.asyncio
 async def test_commit_experience_snapshot_skips_when_no_visible_content_changed():
     viking_fs = SimpleNamespace(commit=AsyncMock())
 
@@ -1855,7 +1873,7 @@ async def test_v3_training_links_case_to_trajectory_and_experience_via_trajector
                 '{"viking://user/u/memories/experiences/booking_duplicate_handling.md":'
                 '["viking://user/u/memories/trajectories/duplicate_booking.md"]}'
             ),
-            "paths": [exp_uri, deleted_exp_uri],
+            "file_paths": [exp_uri, deleted_exp_uri],
             "ctx": _ctx(),
         }
     ]

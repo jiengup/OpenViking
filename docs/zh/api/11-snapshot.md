@@ -59,6 +59,7 @@ USER 和 ADMIN 调用 `commit`、`log`、`restore` 时必须显式传入 `paths`
 |------|------|------|--------|------|
 | message | str | 是 | - | 提交说明 |
 | paths | List[str] | 否 | null | 限定本次快照的 `viking://` URI 列表，条目可以是文件或目录；目录会按照快照的剪枝规则递归展开。USER/ADMIN 必须显式传入；`null` 只保留给本地 ROOT 模式的整棵账号树快照。传入空列表 `[]` 表示显式的空路径集（不会产生改动）。如果某个路径在 VFS 和前一次快照中都不存在，会输出一条 warn，并按"对该名称下任何子树执行删除"处理 |
+| file_paths | List[str] | 否 | null | 调用方声明为文件的 `viking://` URI 列表。每个条目只按单个文件加锁和读取：现存文件正常快照；文件已删除则只记录该文件的删除，不会展开前一次快照中的同名子树；目标实际是目录时返回 `FAILED_PRECONDITION`。适合调用方明确知道目标是文件的场景，例如 `rm` 之后记录删除。可与 `paths` 同时传入；USER/ADMIN 至少要传其中之一 |
 | branch | str | 否 | `main` | 要推进的分支 |
 | author_name | str | 否 | null | 覆盖默认的提交者名字（默认 `viking-bot`） |
 | author_email | str | 否 | null | 覆盖默认的提交者邮箱 |

@@ -10,6 +10,13 @@ pub struct CommitRequest {
     /// Explicit candidate paths (account-relative, e.g. "resources/a.md").
     /// `None` means "enumerate the whole account tree".
     pub paths: Option<Vec<String>>,
+    /// Explicit file-scope candidates (account-relative). Each entry names
+    /// one file: an existing file is snapshotted verbatim, a missing one is
+    /// recorded as that file's deletion only — no prefix expansion into the
+    /// previous snapshot — and a directory is rejected with
+    /// `GitError::PathIsDirectory`. `Some(..)` switches the commit to scoped
+    /// mode even when `paths` is `None`.
+    pub file_paths: Option<Vec<String>>,
     pub author_name: String,
     pub author_email: String,
 }

@@ -42,6 +42,7 @@ class CommitRequest(BaseModel):
 
     message: str
     paths: Optional[List[str]] = None
+    file_paths: Optional[List[str]] = None
     branch: str = "main"
     author_name: Optional[str] = None
     author_email: Optional[str] = None
@@ -59,10 +60,19 @@ async def commit(
         if request.paths is not None
         else None
     )
+    file_paths = (
+        [
+            validate_request_viking_uri(path, _ctx, field_name="file_paths")
+            for path in request.file_paths
+        ]
+        if request.file_paths is not None
+        else None
+    )
     try:
         result = await service.fs.commit(
             message=request.message,
             paths=paths,
+            file_paths=file_paths,
             branch=request.branch,
             author_name=request.author_name,
             author_email=request.author_email,

@@ -408,6 +408,7 @@ fn commit_req(account: &str, branch: &str, message: &str, paths: Option<Vec<Stri
         branch: branch.to_string(),
         message: message.to_string(),
         paths,
+        file_paths: None,
         author_name: "tester".to_string(),
         author_email: "tester@example.com".to_string(),
     }

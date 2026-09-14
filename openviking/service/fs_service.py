@@ -1189,6 +1189,7 @@ class FSService:
         message: str,
         ctx: RequestContext,
         paths: Optional[List[str]] = None,
+        file_paths: Optional[List[str]] = None,
         branch: str = "main",
         author_name: Optional[str] = None,
         author_email: Optional[str] = None,
@@ -1198,6 +1199,7 @@ class FSService:
         return await viking_fs.commit(
             message=message,
             paths=paths,
+            file_paths=file_paths,
             branch=branch,
             author_name=author_name,
             author_email=author_email,

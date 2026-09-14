@@ -225,9 +225,12 @@ async def _commit_experience_snapshot(
         f"{json.dumps(trajectory_map, ensure_ascii=False, sort_keys=True, separators=(',', ':'))}"
     )
     try:
+        # Experience memories are always files. Declaring file scope keeps a
+        # deleted experience absent: the snapshot takes an Exact lock and
+        # records the deletion instead of locking (and materializing) a tree.
         await commit(
             message=message,
-            paths=paths,
+            file_paths=paths,
             ctx=ctx,
         )
     except Exception as exc:
