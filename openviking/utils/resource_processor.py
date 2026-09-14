@@ -422,6 +422,38 @@ class ResourceProcessor:
             )
         )
 
+    @staticmethod
+    def _log_commit_summary(apply_result: Any, *, root_uri: str, is_initial: bool) -> None:
+        """Emit one structured line summarizing what the commit landed.
+
+        Initial import has no target to diff against, so it reports the total
+        file/dir count; an incremental commit reports the per-state file counts
+        from the DiffPlan so operators can see how much the diff actually touched.
+        """
+        if is_initial:
+            logger.info(
+                "[add_resource] initial import committed root=%s files=%d dirs=%d",
+                root_uri,
+                len(apply_result.files),
+                len(apply_result.added_dirs),
+            )
+            return
+        logger.info(
+            "[add_resource] incremental diff committed root=%s "
+            "added=%d modified=%d deleted=%d unchanged=%d repair=%d "
+            "structural=%d orphan_vectors=%d added_dirs=%d deleted_dirs=%d",
+            root_uri,
+            len(apply_result.added),
+            len(apply_result.modified),
+            len(apply_result.deleted),
+            len(apply_result.unchanged),
+            len(apply_result.repair),
+            len(apply_result.structural),
+            len(apply_result.orphan_vectors),
+            len(apply_result.added_dirs),
+            len(apply_result.deleted_dirs),
+        )
+
     async def _vectorize_prepared_files(
         self,
         prepared: Dict[str, Any],
@@ -935,6 +967,11 @@ class ResourceProcessor:
                         local_incremental_file_md5s = self._apply_result_to_file_md5s(
                             apply_result, root_uri
                         )
+                        self._log_commit_summary(
+                            apply_result,
+                            root_uri=root_uri,
+                            is_initial=not target_preexisting,
+                        )
                         incremental_noop = (
                             target_preexisting
                             and not any(
@@ -966,6 +1003,9 @@ class ResourceProcessor:
                             local_artifact_files = list(apply_result.files)
                             local_incremental_file_md5s = self._apply_result_to_file_md5s(
                                 apply_result, root_uri
+                            )
+                            self._log_commit_summary(
+                                apply_result, root_uri=root_uri, is_initial=True
                             )
                         else:
                             await viking_fs.persist_temp_tree(
@@ -1017,6 +1057,9 @@ class ResourceProcessor:
                             apply_result, root_uri
                         )
                         incremental_noop = self._apply_result_is_noop(apply_result)
+                        self._log_commit_summary(
+                            apply_result, root_uri=root_uri, is_initial=False
+                        )
                         if not root_is_file and not incremental_noop:
                             await rewrite_image_uris(
                                 root_uri,
