@@ -281,13 +281,30 @@ class _AccessMixin:
             return real_ctx
         raise PermissionDeniedError(f"ACL management denied for {uri}", resource=uri)
 
-    async def _ensure_acl_target_exists(self, uri: str, ctx: RequestContext) -> None:
+    async def _ensure_acl_target_exists(self, uri: str, ctx: RequestContext) -> bool:
+        """Return whether the ACL target is a directory; raise if it is missing."""
         try:
-            await self._async_agfs.stat(self._uri_to_path(uri, ctx=ctx))
+            stat = await self._async_agfs.stat(self._uri_to_path(uri, ctx=ctx))
         except Exception as exc:
             if is_not_found_error(exc):
                 raise NotFoundError(uri, "resource") from exc
             raise
+        return bool(stat.get("isDir", False)) if isinstance(stat, dict) else False
+
+    async def _acquire_acl_target_lock(self, uri: str, ctx: RequestContext) -> Dict[str, Any]:
+        """Lock an existing ACL target: Exact for a file, Tree for a directory.
+
+        The existence check runs before the lock so a missing target returns
+        NotFound instead of materializing a directory for lock metadata.
+        """
+        is_dir = await self._ensure_acl_target_exists(uri, ctx)
+        path = self._uri_to_path(uri, ctx=ctx)
+        acquire = (
+            self._async_agfs.pathlock_acquire_tree
+            if is_dir
+            else self._async_agfs.pathlock_acquire_exact
+        )
+        return await acquire(path)
 
     async def get_acl(self, uri: str, ctx: Optional[RequestContext] = None) -> Dict[str, Any]:
         real_ctx = await self._ensure_acl_manage(uri, ctx)
@@ -304,8 +321,7 @@ class _AccessMixin:
         acl_mode: AclMode | None = None,
     ) -> Dict[str, Any]:
         real_ctx = await self._ensure_acl_manage(uri, ctx)
-        path = self._uri_to_path(uri, ctx=real_ctx)
-        lease = await self._async_agfs.pathlock_acquire_tree(path)
+        lease = await self._acquire_acl_target_lock(uri, real_ctx)
         try:
             await self._ensure_acl_manage(uri, real_ctx)
             await self._ensure_acl_target_exists(uri, real_ctx)
@@ -341,8 +357,7 @@ class _AccessMixin:
         principal = normalize_acl_principal(principal)
         normalized_level = normalize_acl_level(level) if level is not None else None
         real_ctx = await self._ensure_acl_manage(uri, ctx)
-        path = self._uri_to_path(uri, ctx=real_ctx)
-        lease = await self._async_agfs.pathlock_acquire_tree(path)
+        lease = await self._acquire_acl_target_lock(uri, real_ctx)
         try:
             await self._ensure_acl_manage(uri, real_ctx)
             await self._ensure_acl_target_exists(uri, real_ctx)
