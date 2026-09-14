@@ -10,6 +10,8 @@ store/target interfaces so both AGFS and local backends reuse it.
 
 import pytest
 
+import asyncio
+
 from openviking.parse.output import ParseArtifactRef
 from openviking.storage.resource_diff_apply import apply_diff_plan
 from openviking.storage.viking_fs._diff_plan import DiffPlan
@@ -222,3 +224,34 @@ class TestApplyDiffPlan:
 
         with pytest.raises(IOError, match="boom"):
             await apply_diff_plan(plan, store=store, artifact_ref=_REF, target=target)
+
+    async def test_added_modified_uploads_run_concurrently(self) -> None:
+        # added/modified are independent remote writes and must overlap; a barrier
+        # that only releases once every write is inflight would deadlock a serial
+        # loop.
+        files = {f"f{i}.py": f"c{i}".encode() for i in range(6)}
+        plan = DiffPlan(added=list(files))
+        store = _FakeStore(files)
+
+        started = asyncio.Event()
+        inflight = 0
+        peak = 0
+
+        class _BarrierTarget(_FakeTarget):
+            async def write_file(self, rel_path, data):
+                nonlocal inflight, peak
+                inflight += 1
+                peak = max(peak, inflight)
+                if inflight >= len(files):
+                    started.set()
+                await asyncio.wait_for(started.wait(), timeout=5)
+                inflight -= 1
+                await super().write_file(rel_path, data)
+
+        target = _BarrierTarget()
+        result = await apply_diff_plan(plan, store=store, artifact_ref=_REF, target=target)
+
+        assert peak == len(files)
+        assert set(result.uploaded) == set(files)
+        for name, data in files.items():
+            assert result.md5_by_rel[name] == content_md5(data)

@@ -22,8 +22,9 @@ incomplete snapshot never carries deletions — see build_diff_plan).
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Sequence, Tuple
 
 from openviking.storage.viking_fs._diff_plan import DiffPlan
 from openviking.utils.content_hash import content_md5
@@ -33,8 +34,39 @@ _CONTROL_BASENAMES = frozenset(
 )
 
 
+def _upload_concurrency() -> int:
+    """Resolve the upload fan-out width.
+
+    Uploads here are the same class of independent per-file remote writes as the
+    parse-time staging pass, so they share one knob: whatever
+    ``upload_utils._UPLOAD_CONCURRENCY`` is set to (config/benchmark overrides
+    included) governs both, avoiding a second constant that could drift.
+    """
+    from openviking.parse.parsers import upload_utils
+
+    return max(1, int(getattr(upload_utils, "_UPLOAD_CONCURRENCY", 8)))
+
+
 def _is_business_file(rel_path: str) -> bool:
     return rel_path.rsplit("/", 1)[-1] not in _CONTROL_BASENAMES
+
+
+class _PrefixedReadStore:
+    """Wraps a store so reads re-add a doc_rel prefix to target-relative paths.
+
+    ``apply_full_artifact_upload`` classifies files by their target-relative path
+    (doc_rel stripped) but the artifact stores them under ``<doc_rel>/...``. The
+    shared ``_upload`` helper reads by the key it is handed, so this wrapper puts
+    the prefix back on read, letting the initial-import path reuse the concurrent
+    uploader without a bespoke read call.
+    """
+
+    def __init__(self, store: Any, prefix: str) -> None:
+        self._store = store
+        self._prefix = prefix
+
+    async def read_bytes(self, ref: Any, rel_path: str) -> bytes:
+        return await self._store.read_bytes(ref, f"{self._prefix}{rel_path}")
 
 
 def _covered_by_tree_delete(rel_path: str, roots: List[str]) -> bool:
@@ -62,14 +94,51 @@ class ApplyResult:
     md5_by_rel: Dict[str, str] = field(default_factory=dict)
 
 
-async def _upload(rel_path: str, *, store, artifact_ref, target, result: ApplyResult) -> None:
+async def _upload(rel_path: str, *, store, artifact_ref, target) -> str:
+    """Read one file from the store and write it to the target, returning md5.
+
+    Runs as an independent task so callers can fan out uploads concurrently; the
+    result is returned rather than mutating shared state so parallel writers do
+    not race on the ``ApplyResult`` collections.
+    """
     data = await store.read_bytes(artifact_ref, rel_path)
     # The target may normalize bytes on write (e.g. encoding). md5 must reflect
     # the FINAL stored bytes, so hash what write_file reports it stored.
     written = await target.write_file(rel_path, data)
     final_bytes = written if written is not None else data
-    result.uploaded.append(rel_path)
-    result.md5_by_rel[rel_path] = content_md5(final_bytes)
+    return content_md5(final_bytes)
+
+
+async def _upload_concurrent(
+    rel_paths: Sequence[str],
+    *,
+    store,
+    artifact_ref,
+    target,
+    result: ApplyResult,
+    concurrency: int | None = None,
+) -> None:
+    """Upload ``rel_paths`` with bounded concurrency, recording md5 per file.
+
+    Each file is an independent remote write, so uploads fan out under a
+    semaphore instead of one serial await. The first failure propagates (via
+    ``gather``) so the caller still marks the task failed rather than reporting
+    partial success as done.
+    """
+    if not rel_paths:
+        return
+    sem = asyncio.Semaphore(concurrency if concurrency is not None else _upload_concurrency())
+
+    async def _one(rel_path: str) -> Tuple[str, str]:
+        async with sem:
+            md5 = await _upload(
+                rel_path, store=store, artifact_ref=artifact_ref, target=target
+            )
+        return rel_path, md5
+
+    for rel_path, md5 in await asyncio.gather(*(_one(rel) for rel in rel_paths)):
+        result.uploaded.append(rel_path)
+        result.md5_by_rel[rel_path] = md5
 
 
 async def apply_diff_plan(
@@ -118,10 +187,13 @@ async def apply_diff_plan(
         await target.mkdir(rel_path)
         result.added_dirs.append(rel_path)
 
-    for rel_path in [*plan.added, *plan.modified]:
-        await _upload(
-            rel_path, store=store, artifact_ref=artifact_ref, target=target, result=result
-        )
+    await _upload_concurrent(
+        [*plan.added, *plan.modified],
+        store=store,
+        artifact_ref=artifact_ref,
+        target=target,
+        result=result,
+    )
 
     for rel_path in plan.needs_body_compare:
         new_bytes = await store.read_bytes(artifact_ref, rel_path)
@@ -207,6 +279,7 @@ async def apply_full_artifact_upload(
         return result
 
     directories: set[str] = set()
+    upload_targets: List[str] = []
 
     async def _walk(rel: str) -> None:
         for entry in await store.list(artifact_ref, rel):
@@ -219,14 +292,21 @@ async def apply_full_artifact_upload(
             target_rel = entry.rel_path[len(prefix) :] if prefix else entry.rel_path
             if not _is_business_file(target_rel):
                 continue
-            data = await store.read_bytes(artifact_ref, entry.rel_path)
-            written = await target.write_file(target_rel, data)
-            final_bytes = written if written is not None else data
-            result.uploaded.append(target_rel)
-            result.files.append(target_rel)
-            result.md5_by_rel[target_rel] = content_md5(final_bytes)
+            upload_targets.append(target_rel)
 
     await _walk(base)
+    # Uploads are independent remote writes; fan them out concurrently. The walk
+    # yields target-relative paths, and reads re-add the doc_rel prefix so the
+    # store still resolves the artifact-relative source.
+    prefixed_store = _PrefixedReadStore(store, prefix)
+    await _upload_concurrent(
+        upload_targets,
+        store=prefixed_store,
+        artifact_ref=artifact_ref,
+        target=target,
+        result=result,
+    )
+    result.files.extend(upload_targets)
     for rel_path in sorted(directories, key=lambda value: (value.count("/"), value)):
         await target.mkdir(rel_path)
         result.added_dirs.append(rel_path)

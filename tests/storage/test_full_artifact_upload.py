@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: AGPL-3.0
 """Tests for full-artifact upload (initial import = the plan is all added)."""
 
+import asyncio
+
 import pytest
 
 from openviking.parse.output import ParseArtifactRef
@@ -72,3 +74,41 @@ async def test_full_upload_uploads_all_files_under_doc_root() -> None:
     assert result.md5_by_rel["a.py"] == content_md5(b"aaa")
     assert set(result.uploaded) == {"a.py", "src/b.py"}
     assert target.created_dirs == ["src"]
+
+
+@pytest.mark.asyncio
+async def test_full_upload_runs_writes_concurrently() -> None:
+    # File uploads are independent remote writes and must overlap rather than run
+    # one-await-at-a-time: with N files gated by a barrier that only releases once
+    # every write has started, a serial implementation would deadlock.
+    files = {f"/tmp/art/repository/f{i}.py": f"c{i}".encode() for i in range(5)}
+    ref = ParseArtifactRef(backend="local", root="/tmp/art", root_type="dir")
+    store = _FakeStore(files)
+
+    started = asyncio.Event()
+    inflight = 0
+    peak = 0
+
+    class _BarrierTarget(_FakeTarget):
+        async def write_file(self, rel_path, data):
+            nonlocal inflight, peak
+            inflight += 1
+            peak = max(peak, inflight)
+            if inflight >= len(files):
+                started.set()
+            await asyncio.wait_for(started.wait(), timeout=5)
+            inflight -= 1
+            return await super().write_file(rel_path, data)
+
+    target = _BarrierTarget()
+    result = await apply_full_artifact_upload(
+        store=store,
+        artifact_ref=ref,
+        doc_rel="repository",
+        target=target,
+    )
+
+    assert peak == len(files)
+    assert len(result.uploaded) == len(files)
+    for i in range(5):
+        assert result.md5_by_rel[f"f{i}.py"] == content_md5(f"c{i}".encode())
