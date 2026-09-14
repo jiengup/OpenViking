@@ -1518,3 +1518,114 @@ AGFS 剩余瓶颈已经定位：当前 `CodeRepositoryParser` 的 AGFS 旧写入
 - 优化前 shared-only：`/Users/bytedance/github_openviking/OpenViking/.worktrees/add-resource-shared-baseline/.scratch/ingest-profile/shared-only-baseline40-20260913-012946`
 
 每个场景各 1 个有效样本，结论用于验证功能、阶段归因和工作量收敛，不宣称 P95 或统计显著性。
+
+### 18.14 642 文件三模式、四场景资源评测
+
+为同时验证首次导入、健康 no-op、单文件修改和较大比例修改，使用冻结的 OpenViking Python 源码集执行三组对照。语料包含 642 个文件、7,061,967 bytes、188,387 行；三组 `environment.json.manifest` 规范化后的 SHA-256 均为 `02cbd79658c3074f9323a4d9e2e175a61141136978705862cb2c66c53c6c1450`，逐文件路径、大小、行数和 SHA-256 相同。三组都使用 shared HTTP ZIP 输入、8 路 artifact 上传并发、本地向量库、远程 S3 正式文件系统，以及相同模型和队列配置。
+
+三组仅在代码版本和解析产物后端上不同：
+
+- 优化前 shared-only 基线固定在 `6e04f20ed4f90e79c50f32f88999e2a1e9717ed1`，解析产物写入 AGFS。
+- 当前 SemanticPlan + AGFS 和 SemanticPlan + local 固定在 `17e62a015881cac98ecdb81ad207a13a0628b042`。两者只切换 `storage.parse_output.mode`。
+- 每个场景在 shared 上传后固定等待 5 秒再调用 `add_resources`；端到端时间包含这 5 秒，阶段时间不包含。
+- `edit-one` 追加一个不改变稳定 AST skeleton 的顶层常量；`edit-10%` 在 64 个文件中追加唯一函数，确保文件摘要和受影响目录摘要发生变化。三组 changed list 完全相同。
+- 每组按照 initial → no-op → edit-one → edit-10% 顺序运行，后两个修改场景在同一目标树上累积。每个场景只有 1 个样本，不宣称中位数、P95 或统计显著性。
+
+#### 端到端耗时
+
+| 场景 | 优化前 shared-only | SemanticPlan + AGFS | SemanticPlan + local | AGFS 相对基线 | local 相对基线 | local 相对 AGFS |
+|---|---:|---:|---:|---:|---:|---:|
+| initial | 387.68s | 391.83s | 133.89s | +1.1% | -65.5%（2.90x） | -65.8%（2.93x） |
+| no-op | 433.15s | 343.20s | 10.76s | -20.8%（1.26x） | -97.5%（40.26x） | -96.9%（31.90x） |
+| edit-one | 437.99s | 336.41s | 9.79s | -23.2%（1.30x） | -97.8%（44.72x） | -97.1%（34.35x） |
+| edit-10% | 619.85s（正确性失败） | 448.19s | 130.44s | 原始值 -27.7% | 原始值 -79.0% | -70.9%（3.44x） |
+
+基线 edit-10% 虽然 API 和队列均返回 success，但正式树和 L2 都只有 641/642，不能作为有效性能样本；表中的相对基线降幅仅用于诊断耗时量级，不作为正式加速比。其余对照都通过正确性校验。扣除三组共同的 5 秒等待后，local 的 no-op 和 edit-one 实际处理部分分别约为 5.76 秒和 4.79 秒。
+
+#### 主要阶段耗时
+
+以下均使用 `wall_union_s`。阶段存在嵌套和并行，不能逐列求和还原端到端时间。`提交/diff` 对 initial 表示首次正式树提交，对增量场景表示目标快照与 diff apply；优化前增量场景对应旧 `sync_tree`。
+
+| 模式 / 场景 | 解析及产物写入 | 图片 URI 规范化 | 提交 / diff | Semantic DAG |
+|---|---:|---:|---:|---:|
+| 基线 / initial | 147.56s | — | 141.76s | 84.74s |
+| 基线 / no-op | 146.84s | 0.27s | 190.06s | 77.32s |
+| 基线 / edit-one | 147.48s | 0.26s | 190.50s | 79.25s |
+| 基线 / edit-10% | 145.22s | 0.48s | 392.00s | 63.97s |
+| 当前 AGFS / initial | 144.93s | 8.03s | 133.43s | 91.65s |
+| 当前 AGFS / no-op | 141.20s | 7.01s | 178.35s | 0s |
+| 当前 AGFS / edit-one | 141.85s | 7.22s | 172.94s | 0.45s |
+| 当前 AGFS / edit-10% | 139.10s | 7.01s | 177.85s | 103.92s |
+| 当前 local / initial | 0.86s | 0.04s | 42.25s | 81.25s |
+| 当前 local / no-op | 1.02s | 0.05s | 0.20s | 0s |
+| 当前 local / edit-one | 0.86s | 0.05s | 0.19s | 0.31s |
+| 当前 local / edit-10% | 2.03s | 0.05s | 4.43s | 104.07s |
+
+所有场景的 shared 上传和 worker 物化都小于 0.8 秒；shared 已经消除了旧本地入口的重复 SOURCE 暂存成本，不再是主瓶颈。当前 AGFS 的主要剩余成本是：每次仍把 642 个解析产物写入远程 temp，约 139–145 秒；增量 diff 又因 AGFS 产物没有预计算 MD5 manifest 而回退读取和比较远程正文，约 173–178 秒。SemanticPlan 已经消除了 no-op 的全部语义工作，但无法消除这两段远程文件 I/O。
+
+local 模式在解析时写本地 artifact 并计算最终 bytes 的 MD5；no-op 的 diff apply 为 0.00002 秒，edit-one 为 0.039 秒，只在确定有变化后才上传正式文件。edit-10% 的 4.15 秒 diff apply 对应 64 个变化文件的正式上传。initial 仍需把全量正式文件提交到 S3，因此 persist 为 42.25 秒；其 133.89 秒端到端时间中，Semantic DAG 的 81.25 秒已成为主要成本。
+
+#### 语义与向量工作量
+
+| 场景 | 基线：文件节点 / 目录节点 / overview / embedding | 当前 AGFS | 当前 local |
+|---|---:|---:|---:|
+| initial | 642 / 77 / 77 / 796 | 642 / 77 / 77 / 796 | 642 / 77 / 77 / 796 |
+| no-op | 642 / 77 / 51 / 419 | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 |
+| edit-one | 642 / 77 / 51 / 418 | 1 / 1 / 0 / 1 | 1 / 1 / 0 / 1 |
+| edit-10% | 641 / 77 / 54 / 462 | 64 / 11 / 11 / 86 | 64 / 11 / 11 / 86 |
+
+这里的 overview 使用 `generate_overview.calls`，代表实际目录 LLM 调用；目录节点只表示 DAG 访问或快速判断，不等于一定调用 LLM。edit-one 的文件稳定摘要不变，因此不重新生成目录 overview；但本测试通过 ZIP 输入，`is_code_repo=False`，L2 embedding 默认仍以正文为输入，所以修改文件仍产生 1 次 embedding，而不是代码仓库摘要模式下的纯 `UPDATE_FIELDS`。AGFS 与 local 的语义工作量完全一致，说明 parse output backend 只改变存储和 diff 成本，没有改变 SemanticPlan 的裁剪结果。
+
+#### 进程树内存与本地磁盘峰值
+
+RSS 每 0.1 秒采样，统计 benchmark/server 当前进程及递归子进程的 RSS 总和；本地磁盘每 1 秒采样，只统计本次实验目录，以及该进程新建的 `ov_shared_source_*`、`ov_zip_*` 本机临时目录。远程 S3/AGFS 容量不在统计范围内。
+
+| 模式 / 场景 | RSS 峰值 | 本场景 RSS 峰值增量 | 本地磁盘峰值 | 本场景磁盘峰值增量 |
+|---|---:|---:|---:|---:|
+| 基线 / initial | 344.97 MiB | 17.11 MiB | 27.20 MiB | 17.23 MiB |
+| 基线 / no-op | 350.47 MiB | 3.45 MiB | 40.07 MiB | 8.55 MiB |
+| 基线 / edit-one | 352.12 MiB | 7.08 MiB | 50.30 MiB | 8.53 MiB |
+| 基线 / edit-10% | 352.61 MiB | 1.41 MiB | 59.20 MiB | 8.53 MiB |
+| 当前 AGFS / initial | 340.56 MiB | 16.20 MiB | 29.36 MiB | 19.37 MiB |
+| 当前 AGFS / no-op | 360.00 MiB | 5.08 MiB | 41.21 MiB | 8.55 MiB |
+| 当前 AGFS / edit-one | 318.45 MiB | 6.22 MiB | 44.10 MiB | 8.55 MiB |
+| 当前 AGFS / edit-10% | 318.16 MiB | 6.22 MiB | 46.98 MiB | 8.55 MiB |
+| 当前 local / initial | 331.59 MiB | 9.67 MiB | 29.18 MiB | 19.20 MiB |
+| 当前 local / no-op | 209.20 MiB | 12.83 MiB | 37.34 MiB | 6.81 MiB |
+| 当前 local / edit-one | 214.92 MiB | 9.36 MiB | 39.21 MiB | 8.55 MiB |
+| 当前 local / edit-10% | 314.86 MiB | 136.88 MiB | 43.86 MiB | 13.05 MiB |
+
+local 模式没有出现内存峰值回退：其最大 RSS 为 331.59 MiB，低于基线最大值 352.61 MiB 和当前 AGFS 最大值 360.00 MiB。local edit-10% 的场景内 RSS 增量较高，是因为该轮重新触发 64 个文件节点、11 个目录 LLM 和 86 次 embedding；绝对峰值仍未超过两种 AGFS 路径。
+
+磁盘绝对峰值会随同一进程内四个顺序场景保留的结果、ZIP 和本地向量库增长，因此跨场景更应同时看 `peak_delta`。local 没有把解析产物写入远程 AGFS，但会短暂保留本地 parse artifact；本轮最大本地磁盘峰值为 43.86 MiB，低于基线的 59.20 MiB 和当前 AGFS 的 46.98 MiB。该数据只回答本机落盘成本，不代表远程对象存储占用。
+
+#### 正确性与故障发现
+
+| 模式 | initial | no-op | edit-one | edit-10% |
+|---|---|---|---|---|
+| 优化前基线 | 642/642 通过 | 642/642 通过 | 642/642 通过 | **失败：641/642** |
+| 当前 AGFS | 642/642 通过 | 642/642 通过 | 642/642 通过 | 642/642 通过 |
+| 当前 local | 642/642 通过 | 642/642 通过 | 642/642 通过 | 642/642 通过 |
+
+“通过”同时要求正式文件 URI 集、逐文件正文、L2 URI 集均一致，且 missing、unexpected、content mismatch、vector missing 和队列 error 均为 0。当前 AGFS/local 八轮全部满足这些条件。
+
+基线 edit-10% 在旧 `sync_tree` 中移动 `core/identifiers.py` 时发生 `lock acquire timed out after 0ms`，最终正式文件和 L2 都缺少该 URI；但是 API 仍返回 success，Semantic/Embedding `error_count` 也都是 0。这说明旧链路不仅慢，而且会吞掉单文件同步失败并提交不完整结果。它是本次正确性评测发现，不应通过挑选重跑样本隐藏。
+
+基线 initial 和 no-op 各发生 1 次瞬态 S3 write 失败，由 benchmark 层最多 3 次的短退避重试恢复；正式 OpenViking 代码没有增加 shared 重试。当前 AGFS/local 运行中均未观察到 write 失败或重试。重试次数已随每个结果 JSON 保存。
+
+#### 结论
+
+1. SemanticPlan/最小 DAG 本身有效：即使保留 AGFS parse output，no-op 和 edit-one 也分别比旧基线快 20.8% 和 23.2%，语义工作量从全树收敛为 0 和 1 个文件节点。
+2. 最大收益来自 local parse output 与延迟上传：no-op 为 10.76 秒、edit-one 为 9.79 秒，相对基线分别下降 97.5% 和 97.8%；相对同一当前代码的 AGFS 模式也下降 96.9% 和 97.1%。
+3. 首次导入仍需全量语义和正式 S3 提交。SemanticPlan + AGFS 与基线基本持平，local 通过去掉 AGFS temp 全量写入将端到端从 387.68 秒降到 133.89 秒，下降 65.5%。
+4. 10% 修改时模型计算重新成为主成本：local 的文件系统阶段约 6.5 秒，Semantic DAG 为 104.07 秒，最终 130.44 秒；因此收益从 no-op/edit-one 的约 40–45 倍回落，但相对当前 AGFS 仍快 3.44 倍。
+5. 资源代价可控。local 没有提高绝对 RSS 峰值，本地磁盘最大峰值也低于两种 AGFS 路径；新增本地 artifact 的空间成本没有抵消延迟收益。
+6. 若还要优化 AGFS 模式，应优先让 AGFS parse output 在写最终 bytes 时生成 MD5 manifest，避免增量 diff 的 642 文件远程正文回退比较；但远程 temp 全量上传本身仍会保留约 140 秒成本，无法达到 local 模式的量级。
+
+证据目录：
+
+- 优化前基线：`/Users/bytedance/github_openviking/OpenViking/.worktrees/add-resource-shared-baseline/.scratch/ingest-profile/shared-only-full-resources-retry-20260914`
+- 当前 AGFS：`.scratch/ingest-profile/semantic-plan-full-agfs-resources-20260914`
+- 当前 local：`.scratch/ingest-profile/semantic-plan-full-local-resources-20260914`
+
+benchmark runner 和测试仍只保留在本地工作区，不纳入正式提交。
