@@ -20,7 +20,9 @@ from typing import List, Mapping
 
 # Control sidecars / metadata that are derived outputs, never business files.
 # They must not enter the business diff or they would be classified as deletions.
-_CONTROL_BASENAMES = frozenset(
+# Single source of truth: resource_diff and resource_diff_apply import this set so
+# adding a new sidecar name only touches one place.
+CONTROL_BASENAMES = frozenset(
     {".abstract.md", ".overview.md", ".image_mappings.json", ".artifact_manifest.json"}
 )
 
@@ -73,7 +75,7 @@ class DiffPlan:
 
 
 def _is_control_path(rel_path: str) -> bool:
-    return rel_path.rsplit("/", 1)[-1] in _CONTROL_BASENAMES
+    return rel_path.rsplit("/", 1)[-1] in CONTROL_BASENAMES
 
 
 def build_diff_plan(

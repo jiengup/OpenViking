@@ -26,12 +26,8 @@ import asyncio
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Sequence, Tuple
 
-from openviking.storage.viking_fs._diff_plan import DiffPlan
+from openviking.storage.viking_fs._diff_plan import CONTROL_BASENAMES, DiffPlan
 from openviking.utils.content_hash import content_md5
-
-_CONTROL_BASENAMES = frozenset(
-    {".abstract.md", ".overview.md", ".image_mappings.json", ".artifact_manifest.json"}
-)
 
 
 def _upload_concurrency() -> int:
@@ -48,7 +44,7 @@ def _upload_concurrency() -> int:
 
 
 def _is_business_file(rel_path: str) -> bool:
-    return rel_path.rsplit("/", 1)[-1] not in _CONTROL_BASENAMES
+    return rel_path.rsplit("/", 1)[-1] not in CONTROL_BASENAMES
 
 
 class _PrefixedReadStore:

@@ -26,6 +26,7 @@ from typing import Any, Dict, Tuple
 from openviking.core.namespace import uri_parts
 from openviking.storage.internal_names import STORAGE_INTERNAL_ENTRY_NAMES
 from openviking.storage.viking_fs._diff_plan import (
+    CONTROL_BASENAMES,
     DiffPlan,
     NewEntry,
     TargetFile,
@@ -33,10 +34,6 @@ from openviking.storage.viking_fs._diff_plan import (
     build_diff_plan,
 )
 from openviking_cli.utils import VikingURI
-
-_CONTROL_BASENAMES = frozenset(
-    {".abstract.md", ".overview.md", ".image_mappings.json", ".artifact_manifest.json"}
-)
 
 
 @dataclass(frozen=True)
@@ -52,7 +49,7 @@ def _is_excluded_rel_path(rel_path: str) -> bool:
     if not rel_path:
         return True
     for segment in rel_path.split("/"):
-        if segment in STORAGE_INTERNAL_ENTRY_NAMES or segment in _CONTROL_BASENAMES:
+        if segment in STORAGE_INTERNAL_ENTRY_NAMES or segment in CONTROL_BASENAMES:
             return True
     return False
 

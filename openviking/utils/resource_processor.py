@@ -422,6 +422,43 @@ class ResourceProcessor:
             )
         )
 
+    async def _vectorize_prepared_files(
+        self,
+        prepared: Dict[str, Any],
+        root_uri: str,
+        *,
+        local_artifact: Any,
+        ingest_options: IngestOptions | None,
+        ctx: RequestContext,
+    ) -> None:
+        """Vectorize a committed directory's files (full tree or local changed subset).
+
+        Shared by the ``vectors_only`` semantic-plan branch and the plain
+        vectors-only path so both resolve the local artifact store + changed-file
+        subset identically instead of duplicating the derivation.
+        """
+        local_store = self._build_parse_output_store() if local_artifact is not None else None
+        artifact_files = prepared.get("artifact_files")
+        if local_artifact is not None and prepared.get("changes") is not None:
+            base = root_uri.rstrip("/") + "/"
+            changed_uris = {
+                uri
+                for kind in ("added", "modified")
+                for uri in prepared["changes"].get(kind, [])
+            }
+            artifact_files = sorted(
+                uri[len(base) :] for uri in changed_uris if uri.startswith(base)
+            )
+        await self._vectorize_resource_files(
+            root_uri,
+            ctx=ctx,
+            ingest_options=ingest_options,
+            artifact_store=local_store,
+            artifact_ref=local_artifact,
+            artifact_files=artifact_files,
+            file_md5s=prepared.get("file_md5s"),
+        )
+
     @staticmethod
     def _empty_directory_error(meta: Dict[str, Any]) -> str:
         """Build a bounded error message for a directory with no successful files."""
@@ -909,10 +946,8 @@ class ResourceProcessor:
                             semantic_plan = None
                         temp_uri = root_uri
                         source_committed = True
-                    if not target_preexisting:
-                        if use_semantic_plan:
-                            pass
-                        elif artifact_ref is not None and artifact_ref.backend == "local":
+                    elif not target_preexisting:
+                        if artifact_ref is not None and artifact_ref.backend == "local":
                             # Local artifacts are not in AGFS temp, so persist by
                             # uploading every file under the document root to the
                             # final resource location (initial import = all added).
@@ -952,8 +987,6 @@ class ResourceProcessor:
                             )
                         temp_uri = root_uri
                         source_committed = True
-                    elif use_semantic_plan:
-                        pass
                     elif artifact_ref is not None and artifact_ref.backend == "local":
                         # Incremental local import: the target already exists, so
                         # only upload changed files and delete removed ones,
@@ -1289,28 +1322,12 @@ class ResourceProcessor:
                             file_md5=(prepared.get("file_md5s") or {}).get(root_uri),
                         )
                     elif vectors_only:
-                        local_store = (
-                            self._build_parse_output_store() if local_artifact is not None else None
-                        )
-                        local_vector_files = prepared.get("artifact_files")
-                        if local_artifact is not None and prepared.get("changes") is not None:
-                            changed_uris = {
-                                uri
-                                for kind in ("added", "modified")
-                                for uri in prepared["changes"].get(kind, [])
-                            }
-                            base = root_uri.rstrip("/") + "/"
-                            local_vector_files = sorted(
-                                uri[len(base) :] for uri in changed_uris if uri.startswith(base)
-                            )
-                        await self._vectorize_resource_files(
+                        await self._vectorize_prepared_files(
+                            prepared,
                             root_uri,
-                            ctx=ctx,
+                            local_artifact=local_artifact,
                             ingest_options=ingest_options,
-                            artifact_store=local_store,
-                            artifact_ref=local_artifact,
-                            artifact_files=local_vector_files,
-                            file_md5s=prepared.get("file_md5s"),
+                            ctx=ctx,
                         )
             except BaseException:
                 await cleanup_artifact_if_owned()
@@ -1350,29 +1367,13 @@ class ResourceProcessor:
                     await cleanup_artifact_if_owned()
                     raise
             else:
-                local_store = (
-                    self._build_parse_output_store() if local_artifact is not None else None
-                )
-                local_vector_files = prepared.get("artifact_files")
-                if local_artifact is not None and prepared.get("changes") is not None:
-                    changed_uris = {
-                        uri
-                        for kind in ("added", "modified")
-                        for uri in prepared["changes"].get(kind, [])
-                    }
-                    base = root_uri.rstrip("/") + "/"
-                    local_vector_files = sorted(
-                        uri[len(base) :] for uri in changed_uris if uri.startswith(base)
-                    )
                 try:
-                    await self._vectorize_resource_files(
+                    await self._vectorize_prepared_files(
+                        prepared,
                         root_uri,
-                        ctx=ctx,
+                        local_artifact=local_artifact,
                         ingest_options=ingest_options,
-                        artifact_store=local_store,
-                        artifact_ref=local_artifact,
-                        artifact_files=local_vector_files,
-                        file_md5s=prepared.get("file_md5s"),
+                        ctx=ctx,
                     )
                 except BaseException:
                     await cleanup_artifact_if_owned()
