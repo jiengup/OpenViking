@@ -418,7 +418,9 @@ function pluginMessage(content, form) {
 
 function hasStartupProfile(agent) {
   const session = agent.session;
-  const ownEvents = (session?.events || []).slice(session?.header?.seedLength ?? 0);
+  const ownEvents = typeof session?.ownEvents === "function"
+    ? session.ownEvents()
+    : (session?.events || []).slice(session?.header?.seedLength ?? 0);
   const inHistory = ownEvents.some(event => (
     event?.type === "user/message" && isStartupProfile(event.data)
   ));

@@ -80,6 +80,7 @@ export type CommitSessionResult = {
   task_id?: string;
   archive_uri?: string;
   archived?: boolean;
+  reset_context?: boolean;
   /** Present when wait=true and extraction completed. Keyed by category. */
   memories_extracted?: Record<string, number>;
   error?: string;
@@ -845,6 +846,10 @@ export class OpenVikingClient {
        * preserves the pre-v2 "archive everything" behavior.
       */
       keepRecentCount?: number;
+      /** Start empty context in the same session after archiving. */
+      resetContext?: boolean;
+      /** Opt in to the server's turn-aware defaults instead of message-count retention. */
+      retentionMode?: "turn_budget";
       agentId?: string;
     },
   ): Promise<CommitSessionResult> {
@@ -859,12 +864,18 @@ export class OpenVikingClient {
         sessionId,
         wait: options?.wait ?? false,
         keepRecentCount,
+        retentionMode: options?.retentionMode,
       },
       options?.agentId,
     );
     const body: Record<string, unknown> = {};
-    if (keepRecentCount > 0) {
+    if (options?.retentionMode === "turn_budget") {
+      body.retention_mode = "turn_budget";
+    } else if (keepRecentCount > 0) {
       body.keep_recent_count = keepRecentCount;
+    }
+    if (options?.resetContext) {
+      body.reset_context = true;
     }
     const result = await this.request<CommitSessionResult>(
       `/api/v1/sessions/${encodeURIComponent(sessionId)}/commit`,
@@ -872,6 +883,10 @@ export class OpenVikingClient {
       undefined,
       options?.agentId,
     );
+
+    if (options?.resetContext && result.reset_context !== true) {
+      throw new Error("OpenViking server did not confirm reset_context; upgrade the server with the plugin.");
+    }
 
     if (!options?.wait || !result.task_id) {
       return result;
