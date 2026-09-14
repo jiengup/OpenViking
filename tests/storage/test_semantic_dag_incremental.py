@@ -604,8 +604,7 @@ async def test_direct_incremental_update_uses_changes_without_temp_sync(monkeypa
     assert processor.summarized_files == [f"{root_uri}/a.txt"]
     assert processor.vectorized_files == [f"{root_uri}/a.txt"]
     assert processor.sync_calls == []
-    # The same bytes used for summarization/vectorization provide the final md5.
-    assert processor.file_md5s[f"{root_uri}/a.txt"] == content_md5(b"new content")
+    assert processor.file_md5s[f"{root_uri}/a.txt"] == "md5-a-new"
     overview = parse_abstract_overview(fake_fs._file_contents[f"{root_uri}/.overview.md"]).body
     assert "- a.txt: summary" in overview
     assert "- b.txt: old-b" in overview
@@ -662,7 +661,7 @@ async def test_modified_file_with_same_abstract_stops_directory_propagation(monk
 
     assert processor.summarized_files == [file_uri]
     assert processor.vectorized_files == [file_uri]
-    assert processor.file_md5s[file_uri] == content_md5(b"changed body")
+    assert processor.file_md5s[file_uri] == "new-md5"
     assert processor.generated_overviews == []
     assert processor.vectorized_dirs == []
     assert fake_fs._file_contents[f"{child_uri}/.overview.md"] == old_child_overview

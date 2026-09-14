@@ -1092,11 +1092,11 @@ class SemanticDagExecutor:
                 vectorize_kwargs: Dict[str, Any] = {}
                 if file_content is not None:
                     vectorize_kwargs["file_content"] = file_content
-                file_md5 = (
-                    content_md5(file_content)
-                    if file_content is not None
-                    else self._file_md5s.get(file_path.rstrip("/")) or None
-                )
+                manifest_md5 = self._file_md5s.get(file_path.rstrip("/")) or None
+                if file_content is not None and self._generation_trigger == "content_write":
+                    file_md5 = content_md5(file_content)
+                else:
+                    file_md5 = manifest_md5
                 entry = self._plan_entries_by_uri.get(file_path.rstrip("/"))
                 old_l2 = (
                     next((record for record in entry.indexed_records if record.level == 2), None)
