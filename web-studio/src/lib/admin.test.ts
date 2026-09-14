@@ -1,46 +1,73 @@
-import { describe, expect, it, vi } from 'vitest'
-import type * as OvClient from '#/lib/ov-client'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+import type * as Client from '#/gen/ov-client/client'
+import { fetchAdminUsersPage } from './admin'
 
-import { fetchAdminUsers } from './admin'
-
-vi.mock('#/lib/ov-client', async (importOriginal) => {
-  const original = await importOriginal<typeof OvClient>()
+const { getMock } = vi.hoisted(() => ({ getMock: vi.fn() }))
+vi.mock('#/gen/ov-client/client', async (importOriginal) => {
+  const original = await importOriginal<typeof Client>()
   return {
     ...original,
-    getAdminAccountIdUsers: vi.fn(async (options) => {
-      const users = Array.from({ length: 2833 }, (_, index) => ({
-        user_id: `user-${index + 1}`,
-        role: index === 2832 ? 'admin' : 'user',
-      }))
-      return {
-        headers: {},
-        status: 200,
-        data: {
-          status: 'ok',
-          result: users.slice(0, options.query?.limit),
-        },
-      }
-    }),
+    createClient: () => ({ ...original.createClient(), get: getMock }),
   }
 })
 
-describe('fetchAdminUsers', () => {
-  it('includes users and administrators beyond the first 500 members', async () => {
-    const users = await fetchAdminUsers(
-      {
-        accountId: 'default',
-        apiKey: 'test-key',
-        baseUrl: 'http://localhost:1933',
-        userId: 'root',
-      },
-      'customer_agent_as',
-    )
+const connection = {
+  accountId: 'default',
+  apiKey: 'test-key',
+  baseUrl: 'http://localhost:1933',
+  userId: 'root',
+}
 
-    expect(users).toHaveLength(2833)
-    expect(users.at(-1)).toMatchObject({
-      accountId: 'customer_agent_as',
-      userId: 'user-2833',
-      role: 'admin',
+describe('fetchAdminUsersPage', () => {
+  beforeEach(() => {
+    getMock.mockReset()
+  })
+
+  it('requests only the selected page and uses server totals', async () => {
+    getMock.mockResolvedValue({
+      status: 200,
+      headers: {},
+      data: {
+        status: 'ok',
+        result: {
+          users: [{ user_id: 'user-2833', role: 'admin' }],
+          total: 1,
+          account_total: 2833,
+          manager_count: 2,
+          key_count: 2830,
+        },
+      },
     })
+    const result = await fetchAdminUsersPage(connection, 'customer_agent_as', {
+      page: 2,
+      pageSize: 20,
+      search: ' USER-2833 ',
+    })
+    expect(getMock).toHaveBeenCalledWith({
+      url: '/api/v1/admin/accounts/{account_id}/users',
+      path: { account_id: 'customer_agent_as' },
+      query: { page: 2, limit: 20, query: 'USER-2833', include_summary: true },
+    })
+    expect(result).toMatchObject({
+      total: 1,
+      accountTotal: 2833,
+      managerCount: 2,
+      keyCount: 2830,
+      users: [
+        { accountId: 'customer_agent_as', userId: 'user-2833', role: 'admin' },
+      ],
+    })
+  })
+
+  it('propagates errors instead of falling back to an unbounded request', async () => {
+    getMock.mockRejectedValue(new Error('Request failed'))
+    await expect(
+      fetchAdminUsersPage(connection, 'account', {
+        page: 1,
+        pageSize: 20,
+        search: '',
+      }),
+    ).rejects.toMatchObject({ message: 'Request failed' })
+    expect(getMock).toHaveBeenCalledTimes(1)
   })
 })
