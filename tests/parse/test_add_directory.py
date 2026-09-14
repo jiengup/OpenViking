@@ -57,7 +57,7 @@ class FakeVikingFS:
             content = content.encode("utf-8")
         self.files[uri] = content
 
-    async def write_file_bytes(self, uri: str, content: bytes) -> None:
+    async def write_file_bytes(self, uri: str, content: bytes, **kw) -> None:
         self.files[uri] = content
 
     # ---- read / list operations ------------------------------------------
@@ -109,7 +109,7 @@ class FakeVikingFS:
 
     # ---- temp URI --------------------------------------------------------
 
-    def create_temp_uri(self) -> str:
+    def create_temp_uri(self, ctx: Any = None) -> str:
         self._temp_counter += 1
         return f"viking://temp/dir_{self._temp_counter}"
 
@@ -236,7 +236,11 @@ class TestDirectoryParserBasic:
                 exclude="*.excalidraw.md",
             )
 
-        uploaded_paths = {uri.split("/repository/", 1)[-1] for uri in fake_fs.files}
+        uploaded_paths = {
+            uri.split("/repository/", 1)[-1]
+            for uri in fake_fs.files
+            if "/repository/" in uri
+        }
         assert result.parser_name == "CodeRepositoryParser"
         assert uploaded_paths == {"notes/article.md"}
 

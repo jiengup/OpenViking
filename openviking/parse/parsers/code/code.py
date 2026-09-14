@@ -125,10 +125,15 @@ class CodeRepositoryParser(BaseParser):
         """
         start_time = time.time()
         source_path = Path(source)
+        # Always work through a ParseOutputStore. Local mode threads one in via
+        # kwargs; otherwise default to the AGFS-backed store so the parser has a
+        # single, backend-agnostic write path (no viking_fs/store branching).
         output_store = kwargs.get("parse_output_store")
+        if output_store is None:
+            from openviking.parse.output import AgfsParseOutputStore
+
+            output_store = AgfsParseOutputStore(viking_fs=self._get_viking_fs())
         artifact_ref = None
-        viking_fs = None
-        temp_viking_uri = None
 
         # Check if source is already a local directory (should always be true)
         if not source_path.is_dir():
@@ -164,19 +169,11 @@ class CodeRepositoryParser(BaseParser):
 
             local_dir = source_path
 
-            # 3. Allocate the artifact root. Local mode (a parse_output_store was
-            # threaded through kwargs) writes into that store on the local disk;
-            # otherwise the legacy AGFS temp path is used. Either way the layout
-            # is viking-temp-shaped: <root>/repository/...
-            if output_store is not None:
-                artifact_ref = await output_store.create_artifact(root_type="dir")
-                temp_viking_uri = artifact_ref.root
-                viking_fs = None
-            else:
-                viking_fs = self._get_viking_fs()
-                temp_viking_uri = self._create_temp_uri()
-            # The structure in temp should be: <root>/repository/...
-            # Use simple name 'repository' for temp, TreeBuilder will rename it to org/repo later
+            # 3. Allocate the artifact root through the store. Local mode writes
+            # to a shared local dir; AGFS mode writes to viking://temp. Either way
+            # the layout is <root>/repository/... and the parser code is identical.
+            artifact_ref = await output_store.create_artifact(root_type="dir")
+            temp_viking_uri = artifact_ref.root
             target_root_uri = f"{temp_viking_uri}/repository"
 
             logger.info(f"Uploading code repository artifacts to: {target_root_uri}")
@@ -184,13 +181,11 @@ class CodeRepositoryParser(BaseParser):
             # 4. Upload to the artifact store (filtering on the fly)
             file_count, upload_failures = await self._upload_directory(
                 local_dir,
-                "repository" if output_store is not None else target_root_uri,
-                viking_fs,
+                output_store=output_store,
+                artifact_ref=artifact_ref,
                 ignore_dirs=kwargs.get("ignore_dirs"),
                 include=kwargs.get("include"),
                 exclude=kwargs.get("exclude"),
-                output_store=output_store,
-                artifact_ref=artifact_ref,
             )
             if upload_failures:
                 detail = "; ".join(upload_failures[:5])
@@ -230,8 +225,7 @@ class CodeRepositoryParser(BaseParser):
                 parse_time=time.time() - start_time,
             )
             result.temp_dir_path = temp_viking_uri  # Points to parent of repo_name
-            if artifact_ref is not None:
-                result.artifact_ref = artifact_ref
+            result.artifact_ref = artifact_ref
             result.meta["file_count"] = file_count
             result.meta["repo_name"] = repo_name
             if branch:
@@ -243,22 +237,13 @@ class CodeRepositoryParser(BaseParser):
 
         except Exception as e:
             logger.error(f"Failed to parse repository {source}: {e}", exc_info=True)
-            if output_store is not None and artifact_ref is not None:
+            if artifact_ref is not None:
                 try:
                     await output_store.cleanup(artifact_ref)
                 except Exception as cleanup_error:
                     logger.warning(
                         "Failed to clean repository parse artifact %s: %s",
                         artifact_ref.root,
-                        cleanup_error,
-                    )
-            elif viking_fs is not None and temp_viking_uri:
-                try:
-                    await viking_fs.delete_temp(temp_viking_uri)
-                except Exception as cleanup_error:
-                    logger.warning(
-                        "Failed to clean repository temp artifact %s: %s",
-                        temp_viking_uri,
                         cleanup_error,
                     )
             # Use original URL for error case as well - still important for TreeBuilder
@@ -623,23 +608,20 @@ class CodeRepositoryParser(BaseParser):
     async def _upload_directory(
         self,
         local_dir: Path,
-        viking_uri_base: str,
-        viking_fs: Any,
         *,
+        output_store: Any,
+        artifact_ref: Any,
         ignore_dirs: Optional[Union[Set[str], List[str], str]] = None,
         include: Optional[str] = None,
         exclude: Optional[str] = None,
-        output_store: Any = None,
-        artifact_ref: Any = None,
     ) -> Tuple[int, List[str]]:
-        """Recursively upload directory to the artifact store (AGFS or local)."""
+        """Recursively upload the repository into the artifact store under repository/."""
         return await upload_directory(
             local_dir,
-            viking_uri_base,
-            viking_fs,
+            "repository",
+            store=output_store,
+            artifact_ref=artifact_ref,
             ignore_dirs=ignore_dirs,
             include=include,
             exclude=exclude,
-            output_store=output_store,
-            artifact_ref=artifact_ref,
         )
