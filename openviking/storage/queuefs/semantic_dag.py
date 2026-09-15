@@ -846,6 +846,11 @@ class SemanticDagExecutor:
         if record is None:
             return None
         values = {
+            # Preserve the actual vector-store primary key for an existing
+            # same-level record. Re-vectorization must upsert this id rather than
+            # assuming the locally derived deterministic id matches legacy or
+            # externally written data.
+            "_record_id": record.record_id,
             "type": record.type,
             "created_at": record.created_at,
             "active_count": record.active_count,

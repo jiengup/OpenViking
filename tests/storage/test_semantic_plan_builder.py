@@ -217,6 +217,60 @@ async def test_incremental_builder_marks_new_directory_and_its_files_added():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("new_entry", "target_file", "inventory_levels"),
+    [
+        (NewEntry(md5="new-file"), TargetFile(is_dir=True), (0, 1)),
+        (NewEntry(is_dir=True), TargetFile(is_dir=False), (2,)),
+    ],
+)
+async def test_builder_keeps_structural_old_levels_on_added_entry(
+    new_entry, target_file, inventory_levels
+):
+    # Structural paths are excluded from orphan_vector_deletes because their old
+    # inventory is carried on the added entry. The processor then deletes only
+    # levels invalid for the new kind before the DAG rebuilds the new levels.
+    root = "viking://resources/repo"
+    inventory = {
+        f"old-l{level}": {
+            "id": f"old-l{level}",
+            "uri": f"{root}/mod",
+            "level": level,
+        }
+        for level in inventory_levels
+    }
+    vikingdb = AsyncMock()
+
+    plan = await build_semantic_plan(
+        root_uri=root,
+        context_type="resource",
+        new={"mod": new_entry},
+        target_files={"mod": target_file},
+        diff_plan=DiffPlan(
+            structural=["mod"],
+            added=[] if new_entry.is_dir else ["mod"],
+            added_dirs=["mod"] if new_entry.is_dir else [],
+            new_files=[] if new_entry.is_dir else ["mod"],
+            new_md5s={"mod": new_entry.md5} if new_entry.md5 else {},
+        ),
+        inventory=inventory,
+        vikingdb=vikingdb,
+        ctx=_Ctx(),
+        vectorize=True,
+        is_code_repo=False,
+        root_preexisting=True,
+    )
+
+    entries = {entry.relative_path: entry for entry in plan.tree.entries}
+    assert entries["mod"].state == "added"
+    assert [record.level for record in entries["mod"].indexed_records] == list(
+        inventory_levels
+    )
+    assert plan.orphan_vector_deletes == ()
+    vikingdb.hydrate_incremental_records.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_builder_keeps_deleted_records_on_tombstone_and_pure_orphans_separate():
     root = "viking://resources/repo"
     inventory = {

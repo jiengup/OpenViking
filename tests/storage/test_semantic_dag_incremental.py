@@ -153,6 +153,7 @@ class _FakeProcessor:
         self.file_md5s[file_path] = file_md5
         self.file_contents[("vector", file_path)] = file_content
         self.file_contents[("partial_update", file_path)] = partial_update
+        self.file_contents[("scalar_override", file_path)] = scalar_override
 
     async def _vectorize_directory(
         self,
@@ -170,6 +171,7 @@ class _FakeProcessor:
         self.directory_ingest_options[uri] = ingest_options
         self.vectorized_dirs.append(uri)
         self.file_contents[("partial_update", uri)] = partial_update
+        self.file_contents[("scalar_overrides", uri)] = scalar_overrides
         return None
 
     async def _update_file_vector_fields(
@@ -228,7 +230,25 @@ async def test_plan_dag_uses_manifest_adjacency_without_listing_unchanged_subtre
         context_type="resource",
         tree=SemanticTreeSnapshot(
             entries=(
-                SemanticTreeEntry(relative_path="src", kind="directory", state="unchanged"),
+                SemanticTreeEntry(
+                    relative_path="src",
+                    kind="directory",
+                    state="unchanged",
+                    indexed_records=(
+                        IndexedRecordSnapshot(
+                            record_id="src-l0",
+                            level=0,
+                            abstract="old abstract",
+                            created_at="2026-09-01T00:00:00Z",
+                        ),
+                        IndexedRecordSnapshot(
+                            record_id="src-l1",
+                            level=1,
+                            abstract="old overview",
+                            created_at="2026-09-01T00:00:00Z",
+                        ),
+                    ),
+                ),
                 SemanticTreeEntry(
                     relative_path="src/a.py",
                     kind="file",
@@ -278,6 +298,11 @@ async def test_plan_dag_uses_manifest_adjacency_without_listing_unchanged_subtre
     assert processor.generated_overviews == [src_uri]
     assert processor.file_contents[("partial_update", changed_uri)] is False
     assert processor.file_contents[("partial_update", src_uri)] is False
+    assert processor.file_contents[("scalar_override", changed_uri)]["_record_id"] == "a-l2"
+    assert processor.file_contents[("scalar_overrides", src_uri)] == {
+        0: {"_record_id": "src-l0", "created_at": "2026-09-01T00:00:00Z"},
+        1: {"_record_id": "src-l1", "created_at": "2026-09-01T00:00:00Z"},
+    }
     overview = parse_abstract_overview(fake_fs._file_contents[f"{src_uri}/.overview.md"]).body
     assert "- b.py: old-b" in overview
     assert "- utils/: utils abstract" in overview
@@ -338,7 +363,9 @@ async def test_code_plan_same_abstract_updates_scalars_without_reembedding(monke
     assert len(processor.updated_file_vectors) == 1
     update = processor.updated_file_vectors[0]
     assert update["record_id"] == "a-l2"
-    assert update["file_md5"] == content_md5(b"changed body")
+    # resource_ingest/plan path sources md5 from the plan entry (manifest md5,
+    # the authoritative final-byte fingerprint), not by re-hashing the body.
+    assert update["file_md5"] == "new-md5"
     assert update["file_content"] == b"changed body"
     assert processor.generated_overviews == []
 

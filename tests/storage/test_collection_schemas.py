@@ -810,6 +810,62 @@ async def test_embedding_handler_honors_explicit_full_upsert(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_embedding_handler_honors_existing_record_id_override(monkeypatch):
+    captured = {}
+
+    class _CapturingVikingDB:
+        is_closing = False
+        uses_content_field = False
+
+        async def upsert(self, data, *, ctx, options=UpsertOptions()):
+            captured["data"] = dict(data)
+            return data["id"]
+
+    embedder = _DummyEmbedder()
+    monkeypatch.setattr(
+        "openviking_cli.utils.config.get_openviking_config",
+        lambda: _DummyConfig(embedder),
+    )
+    payload = _build_queue_payload_for_account("acct-existing-id")
+    queue_data = json.loads(payload["data"])
+    queue_data["context_data"]["_upsert_record_id"] = "id-from-vector-db"
+    payload["data"] = json.dumps(queue_data)
+
+    await TextEmbeddingHandler(_CapturingVikingDB()).on_dequeue(payload)
+
+    assert captured["data"]["id"] == "id-from-vector-db"
+    assert "_upsert_record_id" not in captured["data"]
+
+
+@pytest.mark.asyncio
+async def test_embedding_handler_generates_id_when_no_existing_override(monkeypatch):
+    from openviking.storage.vector_ids import vector_record_id
+
+    captured = {}
+
+    class _CapturingVikingDB:
+        is_closing = False
+        uses_content_field = False
+
+        async def upsert(self, data, *, ctx, options=UpsertOptions()):
+            captured["data"] = dict(data)
+            return data["id"]
+
+    embedder = _DummyEmbedder()
+    monkeypatch.setattr(
+        "openviking_cli.utils.config.get_openviking_config",
+        lambda: _DummyConfig(embedder),
+    )
+    payload = _build_queue_payload_for_account("acct-new-id")
+
+    await TextEmbeddingHandler(_CapturingVikingDB()).on_dequeue(payload)
+
+    assert captured["data"]["id"] == vector_record_id(
+        "acct-new-id", "viking://resources/sample", 2
+    )
+
+
+@pytest.mark.asyncio
 async def test_embedding_handler_settles_request_wait_by_message_id(monkeypatch):
     class _CapturingVikingDB:
         is_closing = False

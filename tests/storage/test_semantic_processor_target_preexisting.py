@@ -191,7 +191,11 @@ async def test_semantic_plan_skips_sync_and_runs_only_minimal_roots(monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_plan_added_entry_deletes_every_stale_record(monkeypatch):
+async def test_plan_added_entry_does_not_delete_same_level_stale_record(monkeypatch):
+    # A re-added file (F missing, V had a stale same-level L2) must NOT enqueue a
+    # delete for that record: the re-vectorize upsert reuses the same
+    # deterministic (uri, level) id and overwrites it. Deleting here would race
+    # that upsert on one id.
     from openviking.storage.queuefs.semantic_plan import IndexedRecordSnapshot
 
     queue = SimpleNamespace(enqueue=AsyncMock(return_value="queued"))
@@ -227,8 +231,66 @@ async def test_plan_added_entry_deletes_every_stale_record(monkeypatch):
 
     await SemanticProcessor()._enqueue_plan_vector_deletes(msg, plan)
 
+    # No orphan_vector_deletes and no deleted entries => nothing to delete.
+    queue.enqueue.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("new_kind", "expected_deleted_ids"),
+    [
+        ("file", ["old-l0", "old-l1"]),
+        ("directory", ["old-l2"]),
+    ],
+)
+async def test_plan_structural_flip_deletes_only_cross_level_stale_records(
+    monkeypatch, new_kind, expected_deleted_ids
+):
+    # Structural entries carry the old inventory snapshots directly on the added
+    # entry. Delete only levels invalid for the new kind: dir -> file removes old
+    # L0/L1, file -> dir removes old L2. A same-level record is intentionally kept
+    # because the rebuild upsert reuses and overwrites its deterministic id.
+    from openviking.storage.queuefs.semantic_plan import IndexedRecordSnapshot
+
+    queue = SimpleNamespace(enqueue=AsyncMock(return_value="queued"))
+    manager = SimpleNamespace(
+        EMBEDDING="embedding",
+        get_queue=lambda *_args, **_kwargs: queue,
+    )
+    monkeypatch.setattr(
+        "openviking.storage.queuefs.get_queue_manager",
+        lambda: manager,
+    )
+    plan = SemanticPlan(
+        root_uri="viking://resources/repo",
+        context_type="resource",
+        tree=SemanticTreeSnapshot(
+            entries=(
+                SemanticTreeEntry(
+                    "mod",
+                    new_kind,
+                    "added",
+                    md5="new" if new_kind == "file" else None,
+                    indexed_records=(
+                        IndexedRecordSnapshot("old-l0", 0),
+                        IndexedRecordSnapshot("old-l1", 1),
+                        IndexedRecordSnapshot("old-l2", 2),
+                    ),
+                ),
+            )
+        ),
+    )
+    msg = SemanticMsg(
+        uri=plan.root_uri,
+        context_type="resource",
+        plan_version=1,
+        plan=plan,
+    )
+
+    await SemanticProcessor()._enqueue_plan_vector_deletes(msg, plan)
+
     queued = queue.enqueue.await_args.args[0]
-    assert queued.record_ids == ["stale-l2"]
+    assert queued.record_ids == expected_deleted_ids
 
 
 @pytest.mark.asyncio

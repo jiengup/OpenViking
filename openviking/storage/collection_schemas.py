@@ -855,9 +855,14 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                     upsert_options = normalize_upsert_options(
                         {"partial_update": True, **raw_upsert_options}
                     )
-                    # Ensure vector DB has deterministic IDs per semantic layer.
+                    # Reuse the actual vector-store ID when a semantic plan
+                    # rebuilds an existing same-level record. Only genuinely new
+                    # records derive an ID locally from (account, uri, level).
+                    existing_record_id = inserted_data.pop("_upsert_record_id", None)
                     uri = inserted_data.get("uri")
-                    if uri:
+                    if existing_record_id:
+                        inserted_data["id"] = str(existing_record_id)
+                    elif uri:
                         inserted_data["id"] = vector_record_id(
                             account_id, uri, inserted_data.get("level", 2)
                         )

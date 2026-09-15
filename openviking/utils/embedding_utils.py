@@ -80,6 +80,10 @@ _PORTABLE_SCALAR_FIELDS = frozenset(
 def _apply_scalar_overrides(embedding_msg, overrides: Optional[Dict[str, Any]]) -> None:
     if not embedding_msg or not overrides:
         return
+    record_id = overrides.get("_record_id")
+    if record_id:
+        # Internal queue metadata, removed by TextEmbeddingHandler before upsert.
+        embedding_msg.context_data["_upsert_record_id"] = str(record_id)
     for field in _PORTABLE_SCALAR_FIELDS:
         value = overrides.get(field)
         if value is not None:

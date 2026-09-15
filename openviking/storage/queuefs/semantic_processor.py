@@ -349,12 +349,20 @@ class SemanticProcessor(DequeueHandlerBase):
         from openviking.storage.queuefs.embedding_msg import EmbeddingMsg
         from openviking.utils.embedding_utils import _enqueue_embedding_message
 
+        # Delete only records a deterministic (uri, level) upsert cannot replace.
+        # For added entries this means cross-level leftovers from a file<->dir
+        # flip; same-level stale records are overwritten by the rebuild upsert.
         record_ids = {record.record_id for record in plan.orphan_vector_deletes}
         for entry in plan.tree.entries:
             if entry.state == "deleted":
                 record_ids.update(record.record_id for record in entry.indexed_records)
             elif entry.state == "added":
-                record_ids.update(record.record_id for record in entry.indexed_records)
+                valid_levels = {2} if entry.kind == "file" else {0, 1}
+                record_ids.update(
+                    record.record_id
+                    for record in entry.indexed_records
+                    if record.level not in valid_levels
+                )
         if not record_ids:
             return
         queue_manager = get_queue_manager()

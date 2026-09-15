@@ -1178,3 +1178,30 @@ async def test_full_upsert_append_merges_existing_search_tags_before_enqueue(mon
         "owner=alice",
     ]
     assert msg.context_data["_upsert_options"]["partial_update"] is False
+
+
+@pytest.mark.asyncio
+async def test_full_upsert_carries_existing_record_id_as_internal_override(monkeypatch):
+    queue = DummyQueue()
+    monkeypatch.setattr(embedding_utils, "get_queue_manager", lambda: DummyQueueManager(queue))
+    monkeypatch.setattr(embedding_utils, "get_viking_fs", lambda: DummyFS("body"))
+    monkeypatch.setattr(
+        embedding_utils,
+        "get_openviking_config",
+        lambda: types.SimpleNamespace(
+            embedding=types.SimpleNamespace(text_source="summary_only", max_input_tokens=1000)
+        ),
+    )
+
+    await embedding_utils.vectorize_file(
+        file_path="viking://resources/repo/a.py",
+        summary_dict={"name": "a.py", "summary": "summary"},
+        parent_uri="viking://resources/repo",
+        ctx=DummyReq(),
+        scalar_override={"_record_id": "id-from-vector-db"},
+        partial_update=False,
+    )
+
+    msg = queue.items[0]
+    assert msg.context_data["_upsert_record_id"] == "id-from-vector-db"
+    assert "_record_id" not in msg.context_data
