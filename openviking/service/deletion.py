@@ -18,6 +18,7 @@ from openviking.service.task_tracker import TaskStatus, get_task_tracker
 from openviking.service.task_tracker_concurrency import OwnerLoopDispatcher, run_to_completion
 from openviking.service.task_work_index import extract_task_metadata
 from openviking.storage.queuefs.named_queue import DequeueHandlerBase
+from openviking.storage.queuefs.process_result import ProcessResult
 from openviking.storage.viking_fs import LS_ALL_NODES
 from openviking_cli.exceptions import NotFoundError
 from openviking_cli.session.user_id import UserIdentifier
@@ -276,7 +277,9 @@ class DeletionService:
             vectors = self._service.viking_fs.vector_store
             if vectors is not None:
                 if user_id is None:
-                    await run_to_completion(lambda: vectors.delete_account_data(account_id, ctx=ctx))
+                    await run_to_completion(
+                        lambda: vectors.delete_account_data(account_id, ctx=ctx)
+                    )
                 else:
                     await run_to_completion(
                         lambda: vectors.delete_user_data(account_id, user_id, ctx=ctx)
@@ -400,9 +403,7 @@ class _DeletionProcessor(DequeueHandlerBase):
         service_loop: asyncio.AbstractEventLoop,
     ) -> None:
         self._deletion_service = deletion_service
-        self._dispatcher = OwnerLoopDispatcher()
-        if self._dispatcher.bind_current_loop() is not service_loop:
-            raise ValueError("Deletion processor must be created on the service event loop")
+        self._dispatcher = OwnerLoopDispatcher(service_loop)
 
     @staticmethod
     def _parse_message(data: dict[str, Any]) -> dict[str, Any]:
@@ -431,21 +432,16 @@ class _DeletionProcessor(DequeueHandlerBase):
             },
         }
 
-    async def on_dequeue(self, data: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    async def on_dequeue(self, data: Optional[dict[str, Any]]) -> ProcessResult:
         if not data:
-            return None
+            return ProcessResult.success()
         try:
             message = self._parse_message(data)
         except (json.JSONDecodeError, TypeError, ValueError) as exc:
-            self.report_error(str(exc), data)
-            return None
+            return ProcessResult.failed(str(exc))
 
         error = await self._dispatcher.run(lambda: self._deletion_service._process(message))
-        if error is None:
-            self.report_success()
-        else:
-            self.report_error(error, data)
-        return None
+        return ProcessResult.success() if error is None else ProcessResult.failed(error)
 
 
 async def setup_deletion(

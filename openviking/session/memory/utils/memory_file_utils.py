@@ -108,6 +108,9 @@ def _serialize_with_metadata(
     metadata_json = json.dumps(
         clean_metadata, indent=2, default=_serialize_datetime, ensure_ascii=False
     )
+    # A "-->" inside a value would close the comment early. "\u003e" is the same
+    # character to any JSON parser, so the fields still read back unchanged.
+    metadata_json = metadata_json.replace("-->", "--\\u003e")
 
     comment = f"\n\n<!-- MEMORY_FIELDS\n{metadata_json}\n-->"
 
